@@ -58,6 +58,7 @@ final class BackgroundApplier {
 
   private final String originalEditor = System.getProperty(EDITOR_PROPERTY);
   private final String originalFrame = System.getProperty(FRAME_PROPERTY);
+  private final TextContrast textContrast = new TextContrast();
 
   Result apply(Map<String, Object> desired) {
     Object mode = desired.get("mode");
@@ -71,6 +72,7 @@ final class BackgroundApplier {
           IdeBackgroundUtil.resetBackgroundImagePainters();
           LOG.info("Background Studio background cleared");
         }
+        textContrast.clear();
         return Result.success();
       });
     }
@@ -79,10 +81,12 @@ final class BackgroundApplier {
     }
 
     String spec;
+    int contrast;
     boolean editor;
     boolean frame;
     try {
       spec = buildSpec(desired);
+      contrast = requirePercent(desired, "textContrast");
       editor = requireBoolean(desired, "editor");
       frame = requireBoolean(desired, "frame");
     }
@@ -96,6 +100,8 @@ final class BackgroundApplier {
         IdeBackgroundUtil.resetBackgroundImagePainters();
         LOG.info("Background Studio background applied: " + spec + " editor=" + editor + " frame=" + frame);
       }
+      // Only the editor painter puts the image under editor text.
+      textContrast.apply(editor ? contrast : 0);
       List<String> conflicts = findUserBackgrounds(editor, frame);
       if (conflicts.isEmpty()) {
         return Result.success();
@@ -175,6 +181,14 @@ final class BackgroundApplier {
         reader.dispose();
       }
     }
+  }
+
+  private static int requirePercent(Map<String, Object> desired, String key) {
+    Object value = desired.get(key);
+    if (!(value instanceof Long percent) || percent < 0 || percent > 100) {
+      throw new IllegalArgumentException(key + " 必须是 0-100 的整数。");
+    }
+    return percent.intValue();
   }
 
   private static boolean requireBoolean(Map<String, Object> desired, String key) {

@@ -71,6 +71,14 @@
         "step": 0.01,
         "default": 0
       },
+      "textContrast": {
+        "type": "number",
+        "title": "文字对比度增强（编辑器文字，深色主题调亮、浅色主题调暗）",
+        "minimum": 0,
+        "maximum": 1,
+        "step": 0.01,
+        "default": 0.5
+      },
       "editorEnabled": {
         "type": "boolean",
         "title": "编辑器与面板显示背景（Log、提交等大部分界面）",

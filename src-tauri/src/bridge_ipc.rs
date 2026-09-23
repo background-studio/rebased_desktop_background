@@ -28,6 +28,7 @@ pub struct ShowSpec {
     pub opacity: u8,
     pub fill: &'static str,
     pub anchor: &'static str,
+    pub text_contrast: u8,
     pub editor: bool,
     pub frame: bool,
 }
@@ -60,6 +61,7 @@ impl Desired {
                 "opacity": show.opacity,
                 "fill": show.fill,
                 "anchor": show.anchor,
+                "textContrast": show.text_contrast,
                 "editor": show.editor,
                 "frame": show.frame,
             }),
@@ -71,12 +73,13 @@ impl Desired {
             DesiredMode::Hold => format!("#{} hold", self.seq),
             DesiredMode::Clear => format!("#{} clear", self.seq),
             DesiredMode::Show(show) => format!(
-                "#{} show {} opacity={} {} {} editor={} frame={}",
+                "#{} show {} opacity={} {} {} textContrast={} editor={} frame={}",
                 self.seq,
                 file_name(&show.image),
                 show.opacity,
                 show.fill,
                 show.anchor,
+                show.text_contrast,
                 show.editor,
                 show.frame
             ),
@@ -577,6 +580,7 @@ mod tests {
             opacity: 20,
             fill: "SCALE",
             anchor: "CENTER",
+            text_contrast: 50,
             editor: true,
             frame: false,
         })
@@ -593,6 +597,7 @@ mod tests {
         let json = hub.current().to_json();
         assert_eq!(json["mode"], "show");
         assert_eq!(json["opacity"], 20);
+        assert_eq!(json["textContrast"], 50);
         assert_eq!(json["frame"], false);
         assert_eq!(
             hub.wait_for_ack(3, Duration::from_millis(10)),

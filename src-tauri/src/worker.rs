@@ -283,6 +283,7 @@ impl WorkerState {
             opacity: spec.display.opacity_percent(),
             fill: spec.display.fit.intellij(),
             anchor: spec.display.anchor.intellij(),
+            text_contrast: spec.display.text_contrast_percent(),
             editor: spec.display.editor_enabled,
             frame: spec.display.frame_enabled,
         };
@@ -984,7 +985,7 @@ mod tests {
         let bytes = png([10, 20, 30]);
         let spec = configure_spec(
             &bytes,
-            json!({ "fit": "tile", "opacity": 0.5, "frameEnabled": false }),
+            json!({ "fit": "tile", "opacity": 0.5, "textContrast": 0.3, "frameEnabled": false }),
         );
         let status = state.configure_blocking(spec, bytes).unwrap();
         assert_eq!(status["configured"], true);
@@ -992,6 +993,7 @@ mod tests {
         match state.hub.current().mode {
             DesiredMode::Show(show) => {
                 assert_eq!((show.fill, show.opacity, show.frame), ("TILE", 50, false));
+                assert_eq!(show.text_contrast, 30);
                 assert!(Path::new(&show.image).starts_with(dir.join("media")));
                 assert!(Path::new(&show.image).is_file());
             }

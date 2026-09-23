@@ -82,6 +82,7 @@ pub struct DisplaySettings {
     pub blur: f64,
     pub overlay_color: [u8; 3],
     pub overlay_opacity: f64,
+    pub text_contrast: f64,
     pub editor_enabled: bool,
     pub frame_enabled: bool,
 }
@@ -95,6 +96,7 @@ impl Default for DisplaySettings {
             blur: 0.0,
             overlay_color: [0x10, 0x14, 0x16],
             overlay_opacity: 0.0,
+            text_contrast: 0.5,
             editor_enabled: true,
             frame_enabled: true,
         }
@@ -132,6 +134,7 @@ impl DisplaySettings {
                 .and_then(parse_hex_color)
                 .unwrap_or(defaults.overlay_color),
             overlay_opacity: number("overlayOpacity", defaults.overlay_opacity),
+            text_contrast: number("textContrast", defaults.text_contrast),
             editor_enabled: boolean("editorEnabled", defaults.editor_enabled),
             frame_enabled: boolean("frameEnabled", defaults.frame_enabled),
         }
@@ -140,6 +143,11 @@ impl DisplaySettings {
     /// IntelliJ takes the alpha as an integer percentage.
     pub fn opacity_percent(&self) -> u8 {
         (self.opacity * 100.0).round().clamp(0.0, 100.0) as u8
+    }
+
+    /// The bridge takes the editor text boost as an integer percentage.
+    pub fn text_contrast_percent(&self) -> u8 {
+        (self.text_contrast * 100.0).round().clamp(0.0, 100.0) as u8
     }
 }
 
@@ -181,12 +189,14 @@ mod tests {
             "anchor": "bottom-right",
             "opacity": 0.345,
             "overlayColor": "#FF8000",
+            "textContrast": 0.726,
             "frameEnabled": false
         });
         let settings = DisplaySettings::from_validated(display.as_object().unwrap());
         assert_eq!(settings.fit.intellij(), "TILE");
         assert_eq!(settings.anchor.intellij(), "BOTTOM_RIGHT");
         assert_eq!(settings.opacity_percent(), 35);
+        assert_eq!(settings.text_contrast_percent(), 73);
         assert_eq!(settings.overlay_color, [0xff, 0x80, 0x00]);
         assert!(settings.editor_enabled);
         assert!(!settings.frame_enabled);
@@ -198,5 +208,6 @@ mod tests {
         assert_eq!(settings, DisplaySettings::default());
         assert_eq!(settings.fit.intellij(), "SCALE");
         assert_eq!(settings.opacity_percent(), 20);
+        assert_eq!(settings.text_contrast_percent(), 50);
     }
 }

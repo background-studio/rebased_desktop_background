@@ -6,8 +6,9 @@
   <description><![CDATA[
     Receives background images from the local Rebased Background Studio worker over a
     per-user named pipe and shows them through the built-in IntelliJ background painter.
-    Nothing is written to the IDE settings; closing the worker keeps the current image,
-    and pausing or restoring in Background Studio removes it again.
+    While an image is shown, editor text colours can be lifted in memory to keep them
+    readable over it. Nothing is written to the IDE settings; closing the worker keeps the
+    current image, and pausing or restoring in Background Studio removes both again.
   ]]></description>
   <idea-version since-build="262"/>
   <depends>com.intellij.modules.platform</depends>

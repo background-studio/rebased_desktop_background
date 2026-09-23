@@ -56,6 +56,7 @@ Named Pipe，每行一个 JSON。
     "blur": 0,
     "overlayColor": "#101416",
     "overlayOpacity": 0,
+    "textContrast": 0.5,
     "editorEnabled": true,
     "frameEnabled": true
   }
@@ -70,6 +71,7 @@ Named Pipe，每行一个 JSON。
 | `anchor` | `top-left` … `bottom-right` 九宫格 | `TOP_LEFT` … `BOTTOM_RIGHT` |
 | `opacity` | 0–1 | 取整成 0–100 的不透明度 |
 | `blur` / `overlayColor` / `overlayOpacity` | 0–40 / `#RRGGBB` / 0–0.9 | worker 预处理时烘进图片 |
+| `textContrast` | 0–1 | 取整成 0–100，桥接在内存里把编辑器文字的 HSB 亮度往远离编辑器底色的方向推（深色底 `B + (1-B)·k`，浅色底 `B·(1-k)`）；只在 `editorEnabled` 时生效，0 表示不动 |
 | `editorEnabled` / `frameEnabled` | 布尔 | `idea.background.editor` / `idea.background.frame` |
 
 `hello.capabilities.maxMediaBytes` 与 Manifest 都声明 64 MiB。媒体 URL 仅允许
@@ -120,11 +122,12 @@ worker 不会主动打开 Rebased。
 worker 随后下发目标，目标变化时立即推送，空闲时每 10 秒重发一次当前目标作心跳：
 
 ```json
-{"type":"desired","seq":3,"mode":"show","image":"C:\\...\\media\\<sha256>.png","opacity":20,"fill":"SCALE","anchor":"CENTER","editor":true,"frame":true}
+{"type":"desired","seq":3,"mode":"show","image":"C:\\...\\media\\<sha256>.png","opacity":20,"fill":"SCALE","anchor":"CENTER","textContrast":50,"editor":true,"frame":true}
 ```
 
-`mode` 为 `hold`（保持现状）、`clear`（清除插件设置的背景）或 `show`。`image` 必须是
-`%LOCALAPPDATA%\RebasedBackgroundStudio\media\` 下的 `<sha256>.png`。
+`mode` 为 `hold`（保持现状）、`clear`（清除插件设置的背景和文字增强）或 `show`。`image` 必须是
+`%LOCALAPPDATA%\RebasedBackgroundStudio\media\` 下的 `<sha256>.png`。`show` 必须带 0–100 的
+`textContrast`；0.1.0 的桥接不认识这个字段，会忽略它，Rebased 重启换上新桥接后才生效。
 
 桥接对每条 `desired` 按顺序回报，15 秒内没回报 worker 就断开重来：
 

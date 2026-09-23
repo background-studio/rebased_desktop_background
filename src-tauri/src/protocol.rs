@@ -19,6 +19,7 @@ pub const DISPLAY_KEYS: &[&str] = &[
     "blur",
     "overlayColor",
     "overlayOpacity",
+    "textContrast",
     "editorEnabled",
     "frameEnabled",
 ];
@@ -205,6 +206,7 @@ pub fn validate_display(value: &Value) -> Result<&serde_json::Map<String, Value>
         ("opacity", 0.0, 1.0),
         ("blur", 0.0, 40.0),
         ("overlayOpacity", 0.0, 0.9),
+        ("textContrast", 0.0, 1.0),
     ] {
         let Some(value) = display.get(key) else {
             continue;
@@ -332,12 +334,13 @@ mod tests {
     fn accepts_valid_image_configure() {
         let spec = parse_configure(&configure_with(
             image_media(),
-            json!({ "opacity": 0.4, "fit": "original", "anchor": "top-left" }),
+            json!({ "opacity": 0.4, "fit": "original", "anchor": "top-left", "textContrast": 0.25 }),
         ))
         .unwrap();
         assert_eq!(spec.revision, "rev-1");
         assert_eq!(spec.media.sha256, "a".repeat(64));
         assert_eq!(spec.display.opacity, 0.4);
+        assert_eq!(spec.display.text_contrast, 0.25);
         assert_eq!(spec.display.fit, FitMode::Original);
         assert_eq!(spec.display.anchor, Anchor::TopLeft);
     }
@@ -364,6 +367,8 @@ mod tests {
             json!({ "opacity": 1.5 }),
             json!({ "blur": -1 }),
             json!({ "overlayOpacity": 0.95 }),
+            json!({ "textContrast": 1.2 }),
+            json!({ "textContrast": "high" }),
             json!({ "overlayColor": "red" }),
             json!({ "editorEnabled": "yes" }),
             json!({ "sidebarOpacity": 0.2 }),
