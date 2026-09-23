@@ -1,0 +1,15 @@
+{
+  "name": "rebased-icon-source",
+  "version": "1.0.0",
+  "description": "Reproducible layered assets for the Rebased plugin icon",
+  "scripts": {
+    "prepare-background": "node prepare-background.mjs",
+    "compose": "node compose-icon.mjs",
+    "verify": "node verify-icon.mjs"
+  },
+  "type": "commonjs",
+  "devDependencies": {
+    "sharp": "^0.35.4"
+  },
+  "private": true
+}

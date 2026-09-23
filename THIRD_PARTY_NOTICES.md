@@ -1,7 +1,8 @@
 # Third-Party Notices
 
-The plugin icons (`src-tauri/icons/icon.png`, `src-tauri/icons/icon.ico`) are the
-Rebased application icon:
+The node-graph mark in the plugin icons (`assets/icon.png`, `src-tauri/icons/icon.png`,
+`src-tauri/icons/icon.ico`) is derived from the Rebased application icon
+(`community-resources/resources/rebased.svg`):
 
 - Project: https://github.com/DetachHead/rebased
 - License: Apache License 2.0
