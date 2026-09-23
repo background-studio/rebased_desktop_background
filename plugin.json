@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "pluginProtocol": 2,
+  "id": "rebased",
+  "displayName": "Rebased Background Studio",
+  "exeName": "Rebased Background Studio.exe",
+  "pipeName": "\\\\.\\pipe\\background-studio-rebased",
+  "capabilities": {
+    "commands": ["hello", "configure", "status", "apply", "pause", "restore", "shutdown"],
+    "mediaKinds": ["image"],
+    "autoTakeover": true,
+    "hotUpdate": true,
+    "keepsTargetOnShutdown": true,
+    "maxMediaBytes": 67108864
+  },
+  "settingsSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "fit": {
+        "type": "string",
+        "title": "填充方式",
+        "enum": ["cover", "original", "tile"],
+        "enumLabels": ["覆盖", "原始尺寸", "平铺"],
+        "default": "cover"
+      },
+      "anchor": {
+        "type": "string",
+        "title": "对齐位置",
+        "enum": [
+          "top-left",
+          "top-center",
+          "top-right",
+          "middle-left",
+          "center",
+          "middle-right",
+          "bottom-left",
+          "bottom-center",
+          "bottom-right"
+        ],
+        "enumLabels": ["左上", "上", "右上", "左", "居中", "右", "左下", "下", "右下"],
+        "default": "center"
+      },
+      "opacity": {
+        "type": "number",
+        "title": "背景不透明度",
+        "minimum": 0,
+        "maximum": 1,
+        "step": 0.01,
+        "default": 0.2
+      },
+      "blur": {
+        "type": "number",
+        "title": "模糊",
+        "minimum": 0,
+        "maximum": 40,
+        "step": 1,
+        "default": 0
+      },
+      "overlayColor": {
+        "type": "string",
+        "title": "遮罩颜色",
+        "format": "color",
+        "default": "#101416"
+      },
+      "overlayOpacity": {
+        "type": "number",
+        "title": "遮罩不透明度",
+        "minimum": 0,
+        "maximum": 0.9,
+        "step": 0.01,
+        "default": 0
+      },
+      "editorEnabled": {
+        "type": "boolean",
+        "title": "编辑器与面板显示背景（Log、提交等大部分界面）",
+        "default": true
+      },
+      "frameEnabled": {
+        "type": "boolean",
+        "title": "空编辑区显示背景（没有打开文件时的编辑区）",
+        "default": true
+      }
+    }
+  }
+}
