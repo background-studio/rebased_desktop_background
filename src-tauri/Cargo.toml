@@ -32,6 +32,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
@@ -49,3 +50,44 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# Every slideshow change decodes, re-encodes and hashes a multi-megabyte image; at "s"
+# the PNG encoder alone is ~7x slower.
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.image-webp]
+opt-level = 3
+
+[profile.release.package.png]
+opt-level = 3
+
+[profile.release.package.fdeflate]
+opt-level = 3
+
+[profile.release.package.miniz_oxide]
+opt-level = 3
+
+[profile.release.package.zune-jpeg]
+opt-level = 3
+
+[profile.release.package.zune-core]
+opt-level = 3
+
+[profile.release.package.gif]
+opt-level = 3
+
+[profile.release.package.weezl]
+opt-level = 3
+
+[profile.release.package.crc32fast]
+opt-level = 3
+
+[profile.release.package.adler2]
+opt-level = 3
+
+[profile.release.package.simd-adler32]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3

@@ -1,14 +1,17 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
 
 pub const MSG_NOT_FOUND: &str =
     "没有找到 Rebased：注册表 Software\\detachhead\\Rebased 和正在运行的进程里都没有它的安装位置。";
+const LAUNCHER_NAME: &str = "rebased64.exe";
+/// A PID recycled between two incremental scans is only noticed by a full scan.
+const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installation {
@@ -26,6 +29,178 @@ pub struct RebasedProcess {
     pub pid: u32,
     /// FILETIME ticks (100 ns since 1601-01-01 UTC).
     pub created_at: u64,
+}
+
+/// A running process whose executable is named like the Rebased launcher.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LauncherProcess {
+    pub pid: u32,
+    pub created_at: u64,
+    pub image: String,
+}
+
+pub enum Probe {
+    Launcher(LauncherProcess),
+    /// Another program, or one this worker may not open at all (system services, other
+    /// users); access rights do not change while a process lives.
+    Other,
+    /// Opened but not readable right now, e.g. while exiting; asked again next scan.
+    Unavailable,
+}
+
+pub trait ProcessSource {
+    fn process_ids(&self) -> Result<Vec<u32>, String>;
+    /// Every running process with a flag telling whether its name matches the launcher.
+    fn named_processes(&self, exe_name: &str) -> Result<Vec<(u32, bool)>, String>;
+    fn probe(&self, pid: u32, exe_name: &str) -> Probe;
+    /// The same checks a snapshot applies (image path readable and named `exe_name`, same
+    /// creation time), so exiting processes drop out exactly when they would there.
+    fn still_matches(&self, pid: u32, exe_name: &str, created_at: u64) -> bool;
+}
+
+pub struct SystemProcesses;
+
+impl ProcessSource for SystemProcesses {
+    fn process_ids(&self) -> Result<Vec<u32>, String> {
+        platform::process_ids()
+    }
+
+    fn named_processes(&self, exe_name: &str) -> Result<Vec<(u32, bool)>, String> {
+        platform::named_processes(exe_name)
+    }
+
+    fn probe(&self, pid: u32, exe_name: &str) -> Probe {
+        platform::probe(pid, exe_name)
+    }
+
+    fn still_matches(&self, pid: u32, exe_name: &str, created_at: u64) -> bool {
+        platform::still_matches(pid, exe_name, created_at)
+    }
+}
+
+/// Follows launcher-named processes across the worker's 1 s ticks. A full Toolhelp snapshot
+/// costs ~10 ms on a machine with ~500 processes, so between full scans only PIDs that
+/// appeared since the previous scan are opened, and known launchers are re-validated by
+/// creation time.
+pub struct ProcessTracker {
+    known: HashMap<u32, Option<LauncherProcess>>,
+    last_full_scan: Option<Instant>,
+}
+
+impl Default for ProcessTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessTracker {
+    pub fn new() -> Self {
+        Self {
+            known: HashMap::new(),
+            last_full_scan: None,
+        }
+    }
+
+    pub fn scan(&mut self) -> Result<Vec<LauncherProcess>, String> {
+        self.scan_with(&SystemProcesses, Instant::now())
+    }
+
+    pub fn scan_with(
+        &mut self,
+        source: &impl ProcessSource,
+        now: Instant,
+    ) -> Result<Vec<LauncherProcess>, String> {
+        let full_scan_due = self
+            .last_full_scan
+            .is_none_or(|last| now.saturating_duration_since(last) >= FULL_SCAN_INTERVAL);
+        if full_scan_due {
+            self.full_scan(source)?;
+            self.last_full_scan = Some(now);
+        } else {
+            self.incremental_scan(source)?;
+        }
+        let mut launchers: Vec<LauncherProcess> = self.known.values().flatten().cloned().collect();
+        launchers.sort_by_key(|process| process.pid);
+        Ok(launchers)
+    }
+
+    fn full_scan(&mut self, source: &impl ProcessSource) -> Result<(), String> {
+        let processes = source.named_processes(LAUNCHER_NAME)?;
+        self.known.clear();
+        for (pid, named) in processes {
+            if !named {
+                self.known.insert(pid, None);
+                continue;
+            }
+            match source.probe(pid, LAUNCHER_NAME) {
+                Probe::Launcher(process) => {
+                    self.known.insert(pid, Some(process));
+                }
+                Probe::Other => {
+                    self.known.insert(pid, None);
+                }
+                Probe::Unavailable => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn incremental_scan(&mut self, source: &impl ProcessSource) -> Result<(), String> {
+        let ids = source.process_ids()?;
+        let live: HashSet<u32> = ids.iter().copied().collect();
+        self.known.retain(|pid, process| {
+            live.contains(pid)
+                && process.as_ref().is_none_or(|process| {
+                    source.still_matches(*pid, LAUNCHER_NAME, process.created_at)
+                })
+        });
+        for pid in ids {
+            if let Entry::Vacant(slot) = self.known.entry(pid) {
+                match source.probe(pid, LAUNCHER_NAME) {
+                    Probe::Launcher(process) => {
+                        slot.insert(Some(process));
+                    }
+                    Probe::Other => {
+                        slot.insert(None);
+                    }
+                    Probe::Unavailable => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Installation::from_home` parses a ~136 KB product-info.json; reuse the result until
+/// that file or bin\idea.properties changes.
+#[derive(Default)]
+pub struct InstallationCache {
+    entries: HashMap<PathBuf, (InstallationStamp, Installation)>,
+}
+
+type InstallationStamp = [Option<(SystemTime, u64)>; 2];
+
+impl InstallationCache {
+    fn from_home(&mut self, home: &Path) -> Result<Installation, String> {
+        let stamp = [
+            file_stamp(&home.join("product-info.json")),
+            file_stamp(&home.join("bin").join("idea.properties")),
+        ];
+        if let Some((cached_stamp, installation)) = self.entries.get(home) {
+            if *cached_stamp == stamp && installation.launcher.is_file() {
+                return Ok(installation.clone());
+            }
+        }
+        let installation = Installation::from_home(home)?;
+        self.entries
+            .insert(home.to_path_buf(), (stamp, installation.clone()));
+        Ok(installation)
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 #[derive(Deserialize)]
@@ -119,6 +294,16 @@ impl Installation {
 }
 
 pub fn discover() -> Result<Installation, String> {
+    discover_from(
+        &platform::running_images(LAUNCHER_NAME)?,
+        &mut InstallationCache::default(),
+    )
+}
+
+pub fn discover_from(
+    running_images: &[String],
+    cache: &mut InstallationCache,
+) -> Result<Installation, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut push = |home: PathBuf| {
         let key = normalize_path(&home.to_string_lossy());
@@ -129,8 +314,8 @@ pub fn discover() -> Result<Installation, String> {
             candidates.push(home);
         }
     };
-    for image in platform::running_images("rebased64.exe")? {
-        if let Some(home) = Path::new(&image).parent().and_then(Path::parent) {
+    for image in running_images {
+        if let Some(home) = Path::new(image).parent().and_then(Path::parent) {
             push(home.to_path_buf());
         }
     }
@@ -142,7 +327,7 @@ pub fn discover() -> Result<Installation, String> {
     }
     let mut errors = Vec::new();
     for home in &candidates {
-        match Installation::from_home(home) {
+        match cache.from_home(home) {
             Ok(installation) => return Ok(installation),
             Err(error) => errors.push(error),
         }
@@ -155,6 +340,28 @@ pub fn discover() -> Result<Installation, String> {
 
 pub fn running_processes(installation: &Installation) -> Result<Vec<RebasedProcess>, String> {
     platform::processes_with_image(&installation.launcher)
+}
+
+/// Same result as [`running_processes`], taken from a [`ProcessTracker`] scan.
+pub fn running_processes_in(
+    installation: &Installation,
+    launchers: &[LauncherProcess],
+) -> Result<Vec<RebasedProcess>, String> {
+    let named_like_tracker = installation
+        .launcher
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(LAUNCHER_NAME));
+    if !named_like_tracker {
+        return running_processes(installation);
+    }
+    Ok(launchers
+        .iter()
+        .filter(|process| installation.is_launcher(&process.image))
+        .map(|process| RebasedProcess {
+            pid: process.pid,
+            created_at: process.created_at,
+        })
+        .collect())
 }
 
 pub fn process_image_path(pid: u32) -> Option<String> {
@@ -265,6 +472,7 @@ mod platform {
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
+            ProcessStatus::K32EnumProcesses,
             Registry::{
                 RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER,
                 HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RRF_RT_REG_SZ,
@@ -281,7 +489,7 @@ mod platform {
         },
     };
 
-    use super::{normalize_path, RebasedProcess};
+    use super::{normalize_path, LauncherProcess, Probe, RebasedProcess};
 
     struct HandleGuard(HANDLE);
 
@@ -396,6 +604,63 @@ mod platform {
             }
         })?;
         Ok(processes)
+    }
+
+    pub fn process_ids() -> Result<Vec<u32>, String> {
+        let mut ids = vec![0u32; 1024];
+        loop {
+            let capacity = (ids.len() * std::mem::size_of::<u32>()) as u32;
+            let mut written = 0u32;
+            if unsafe { K32EnumProcesses(ids.as_mut_ptr(), capacity, &mut written) } == 0 {
+                return Err("无法枚举进程。".to_string());
+            }
+            // A completely filled buffer may have been truncated.
+            if written < capacity {
+                ids.truncate(written as usize / std::mem::size_of::<u32>());
+                return Ok(ids);
+            }
+            ids.resize(ids.len() * 2, 0);
+        }
+    }
+
+    pub fn named_processes(exe_name: &str) -> Result<Vec<(u32, bool)>, String> {
+        let mut processes = Vec::new();
+        for_each_process(|pid, name| processes.push((pid, name.eq_ignore_ascii_case(exe_name))))?;
+        Ok(processes)
+    }
+
+    pub fn probe(pid: u32, exe_name: &str) -> Probe {
+        let Some(handle) = open_process(pid) else {
+            return Probe::Other;
+        };
+        let Some(image) = query_image_path(handle.0) else {
+            return Probe::Unavailable;
+        };
+        let named = Path::new(&image)
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(exe_name));
+        if !named {
+            return Probe::Other;
+        }
+        match query_creation_time(handle.0) {
+            Some(created_at) => Probe::Launcher(LauncherProcess {
+                pid,
+                created_at,
+                image,
+            }),
+            None => Probe::Unavailable,
+        }
+    }
+
+    pub fn still_matches(pid: u32, exe_name: &str, created_at: u64) -> bool {
+        let Some(handle) = open_process(pid) else {
+            return false;
+        };
+        query_image_path(handle.0).is_some_and(|image| {
+            Path::new(&image)
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(exe_name))
+        }) && query_creation_time(handle.0) == Some(created_at)
     }
 
     pub fn registry_homes() -> Vec<PathBuf> {
@@ -556,10 +821,26 @@ mod platform {
 mod platform {
     use std::path::{Path, PathBuf};
 
-    use super::RebasedProcess;
+    use super::{Probe, RebasedProcess};
 
     pub fn process_image_path(_pid: u32) -> Option<String> {
         None
+    }
+
+    pub fn process_ids() -> Result<Vec<u32>, String> {
+        Err("仅支持 Windows。".to_string())
+    }
+
+    pub fn named_processes(_exe_name: &str) -> Result<Vec<(u32, bool)>, String> {
+        Err("仅支持 Windows。".to_string())
+    }
+
+    pub fn probe(_pid: u32, _exe_name: &str) -> Probe {
+        Probe::Unavailable
+    }
+
+    pub fn still_matches(_pid: u32, _exe_name: &str, _created_at: u64) -> bool {
+        false
     }
 
     pub fn running_images(_exe_name: &str) -> Result<Vec<String>, String> {
@@ -679,5 +960,282 @@ mod tests {
     fn converts_system_time_to_filetime() {
         assert_eq!(system_time_to_filetime(UNIX_EPOCH), 116_444_736_000_000_000);
         assert!(now_filetime() > 116_444_736_000_000_000);
+    }
+
+    #[derive(Clone)]
+    struct FakeProcess {
+        image: String,
+        created_at: u64,
+        openable: bool,
+        readable: bool,
+    }
+
+    #[derive(Default)]
+    struct FakeProcesses {
+        running: std::cell::RefCell<std::collections::BTreeMap<u32, FakeProcess>>,
+        probes: std::cell::Cell<usize>,
+    }
+
+    impl FakeProcesses {
+        fn start(&self, pid: u32, image: &str, created_at: u64) {
+            self.running.borrow_mut().insert(
+                pid,
+                FakeProcess {
+                    image: image.to_string(),
+                    created_at,
+                    openable: true,
+                    readable: true,
+                },
+            );
+        }
+
+        fn edit(&self, pid: u32, change: impl FnOnce(&mut FakeProcess)) {
+            change(self.running.borrow_mut().get_mut(&pid).unwrap());
+        }
+
+        fn exit(&self, pid: u32) {
+            self.running.borrow_mut().remove(&pid);
+        }
+
+        fn take_probes(&self) -> usize {
+            self.probes.replace(0)
+        }
+    }
+
+    impl ProcessSource for FakeProcesses {
+        fn process_ids(&self) -> Result<Vec<u32>, String> {
+            Ok(self.running.borrow().keys().copied().collect())
+        }
+
+        fn named_processes(&self, exe_name: &str) -> Result<Vec<(u32, bool)>, String> {
+            Ok(self
+                .running
+                .borrow()
+                .iter()
+                .map(|(pid, process)| {
+                    let name = process.image.rsplit('\\').next().unwrap();
+                    (*pid, name.eq_ignore_ascii_case(exe_name))
+                })
+                .collect())
+        }
+
+        fn probe(&self, pid: u32, exe_name: &str) -> Probe {
+            self.probes.set(self.probes.get() + 1);
+            let running = self.running.borrow();
+            let Some(process) = running.get(&pid).filter(|process| process.openable) else {
+                return Probe::Other;
+            };
+            if !process.readable {
+                return Probe::Unavailable;
+            }
+            if !process
+                .image
+                .rsplit('\\')
+                .next()
+                .unwrap()
+                .eq_ignore_ascii_case(exe_name)
+            {
+                return Probe::Other;
+            }
+            Probe::Launcher(LauncherProcess {
+                pid,
+                created_at: process.created_at,
+                image: process.image.clone(),
+            })
+        }
+
+        fn still_matches(&self, pid: u32, exe_name: &str, created_at: u64) -> bool {
+            self.running.borrow().get(&pid).is_some_and(|process| {
+                process.openable
+                    && process.readable
+                    && process
+                        .image
+                        .rsplit('\\')
+                        .next()
+                        .unwrap()
+                        .eq_ignore_ascii_case(exe_name)
+                    && process.created_at == created_at
+            })
+        }
+    }
+
+    const LAUNCHER: &str = r"D:\Rebased\bin\rebased64.exe";
+
+    fn pids(launchers: &[LauncherProcess]) -> Vec<(u32, u64)> {
+        launchers
+            .iter()
+            .map(|process| (process.pid, process.created_at))
+            .collect()
+    }
+
+    #[test]
+    fn tracker_only_opens_new_processes_between_full_scans() {
+        let system = FakeProcesses::default();
+        system.start(4, r"C:\Windows\System32\ntoskrnl.exe", 1);
+        system.start(100, r"C:\Windows\explorer.exe", 2);
+        system.start(200, LAUNCHER, 3);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+
+        assert_eq!(
+            pids(&tracker.scan_with(&system, start).unwrap()),
+            [(200, 3)]
+        );
+        assert_eq!(
+            system.take_probes(),
+            1,
+            "a full scan only opens launcher-named processes"
+        );
+
+        let tick = start + Duration::from_secs(1);
+        assert_eq!(pids(&tracker.scan_with(&system, tick).unwrap()), [(200, 3)]);
+        assert_eq!(system.take_probes(), 0, "nothing new, nothing opened");
+
+        system.start(300, r"C:\Apps\notepad.exe", 4);
+        system.start(301, LAUNCHER, 5);
+        system.exit(200);
+        let tick = start + Duration::from_secs(2);
+        assert_eq!(pids(&tracker.scan_with(&system, tick).unwrap()), [(301, 5)]);
+        assert_eq!(system.take_probes(), 2);
+    }
+
+    #[test]
+    fn tracker_notices_a_recycled_launcher_pid() {
+        let system = FakeProcesses::default();
+        system.start(200, LAUNCHER, 3);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan_with(&system, start).unwrap();
+
+        system.exit(200);
+        system.start(200, LAUNCHER, 9);
+        let tick = start + Duration::from_secs(1);
+        assert_eq!(pids(&tracker.scan_with(&system, tick).unwrap()), [(200, 9)]);
+
+        system.exit(200);
+        system.start(200, r"C:\Apps\notepad.exe", 10);
+        let tick = start + Duration::from_secs(2);
+        assert!(tracker.scan_with(&system, tick).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracker_retries_unreadable_but_not_inaccessible_processes() {
+        let system = FakeProcesses::default();
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan_with(&system, start).unwrap();
+
+        system.start(4, r"C:\Windows\System32\csrss.exe", 1);
+        system.edit(4, |process| process.openable = false);
+        system.start(200, LAUNCHER, 3);
+        system.edit(200, |process| process.readable = false);
+        let tick = start + Duration::from_secs(1);
+        assert!(tracker.scan_with(&system, tick).unwrap().is_empty());
+        assert_eq!(system.take_probes(), 2);
+
+        system.edit(200, |process| process.readable = true);
+        let tick = start + Duration::from_secs(2);
+        assert_eq!(pids(&tracker.scan_with(&system, tick).unwrap()), [(200, 3)]);
+        assert_eq!(
+            system.take_probes(),
+            1,
+            "the inaccessible process is not asked again"
+        );
+    }
+
+    #[test]
+    fn tracker_drops_an_exiting_launcher_like_a_snapshot_does() {
+        let system = FakeProcesses::default();
+        system.start(200, LAUNCHER, 3);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan_with(&system, start).unwrap();
+
+        system.edit(200, |process| process.readable = false);
+        let tick = start + Duration::from_secs(1);
+        assert!(tracker.scan_with(&system, tick).unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_scan_recovers_a_launcher_behind_a_recycled_pid() {
+        let system = FakeProcesses::default();
+        system.start(300, r"C:\Apps\notepad.exe", 1);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan_with(&system, start).unwrap();
+
+        system.exit(300);
+        system.start(300, LAUNCHER, 2);
+        let tick = start + Duration::from_secs(1);
+        assert!(tracker.scan_with(&system, tick).unwrap().is_empty());
+        assert_eq!(
+            pids(
+                &tracker
+                    .scan_with(&system, start + FULL_SCAN_INTERVAL)
+                    .unwrap()
+            ),
+            [(300, 2)]
+        );
+    }
+
+    #[test]
+    fn running_processes_in_keeps_only_this_installation() {
+        let home = fake_home(None);
+        let installation = Installation::from_home(&home).unwrap();
+        let launchers = [
+            LauncherProcess {
+                pid: 1,
+                created_at: 10,
+                image: installation.launcher.to_string_lossy().to_uppercase(),
+            },
+            LauncherProcess {
+                pid: 2,
+                created_at: 20,
+                image: LAUNCHER.to_string(),
+            },
+        ];
+        assert_eq!(
+            running_processes_in(&installation, &launchers).unwrap(),
+            [RebasedProcess {
+                pid: 1,
+                created_at: 10
+            }]
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn installation_cache_reparses_only_when_product_info_changes() {
+        let home = fake_home(None);
+        let info = home.join("product-info.json");
+        let mut cache = InstallationCache::default();
+        assert_eq!(cache.from_home(&home).unwrap().version, "1.1.18");
+
+        let written_at = fs::metadata(&info).unwrap().modified().unwrap();
+        let same_length = fs::read_to_string(&info)
+            .unwrap()
+            .replace("1.1.18", "1.1.19");
+        fs::write(&info, same_length).unwrap();
+        let file = fs::File::options().write(true).open(&info).unwrap();
+        file.set_modified(written_at).unwrap();
+        drop(file);
+        assert_eq!(
+            cache.from_home(&home).unwrap().version,
+            "1.1.18",
+            "unchanged size and time reuse the parsed result"
+        );
+
+        let file = fs::File::options().write(true).open(&info).unwrap();
+        file.set_modified(written_at + Duration::from_secs(5))
+            .unwrap();
+        drop(file);
+        assert_eq!(cache.from_home(&home).unwrap().version, "1.1.19");
+
+        fs::remove_file(home.join("bin").join("rebased64.exe")).unwrap();
+        assert!(
+            cache.from_home(&home).is_err(),
+            "a deleted launcher is noticed"
+        );
+        let _ = fs::remove_dir_all(home);
     }
 }

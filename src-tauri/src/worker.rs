@@ -22,7 +22,7 @@ use crate::{
     models::RuntimeStatus,
     plugin::{hello_result, PLUGIN_ID, PLUGIN_PROTOCOL},
     protocol::{parse_configure, ConfigureSpec},
-    rebased::{self, Installation, RebasedProcess},
+    rebased::{self, Installation, InstallationCache, ProcessTracker, RebasedProcess},
 };
 
 pub const MSG_UNCONFIGURED: &str = "尚未配置背景";
@@ -104,6 +104,14 @@ struct Snapshot {
     bridge_disabled: bool,
 }
 
+/// State the 1 s environment tick carries over so it does not redo a full process
+/// snapshot and re-parse product-info.json every second.
+#[derive(Default)]
+struct TickScanner {
+    tracker: ProcessTracker,
+    installations: InstallationCache,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusResult {
@@ -123,6 +131,7 @@ pub struct WorkerState {
     state_file: PathBuf,
     inner: Mutex<Inner>,
     environment: Mutex<Option<Result<Snapshot, String>>>,
+    scanner: Mutex<TickScanner>,
     hub: BridgeHub,
     busy: AtomicBool,
     shutting_down: AtomicBool,
@@ -179,6 +188,7 @@ impl WorkerState {
                 install_error: None,
             }),
             environment: Mutex::new(None),
+            scanner: Mutex::new(TickScanner::default()),
             hub: BridgeHub::new(initial),
             busy: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -509,7 +519,7 @@ impl WorkerState {
         let wants_bridge = lock(&self.inner)
             .map(|inner| inner.mode == Mode::Armed && inner.configured.is_some())
             .unwrap_or(false);
-        let mut scanned = scan_environment();
+        let mut scanned = self.scan_tick();
         let mut install_outcome = None;
         if let Ok(snapshot) = &mut scanned {
             let needs_install = match snapshot.bridge {
@@ -537,6 +547,25 @@ impl WorkerState {
             }
         }
         self.store_environment(scanned);
+    }
+
+    fn scan_tick(&self) -> Result<Snapshot, String> {
+        let (installation, processes) = {
+            let mut scanner = lock(&self.scanner)?;
+            let TickScanner {
+                tracker,
+                installations,
+            } = &mut *scanner;
+            let launchers = tracker.scan()?;
+            let images: Vec<String> = launchers
+                .iter()
+                .map(|process| process.image.clone())
+                .collect();
+            let installation = rebased::discover_from(&images, installations)?;
+            let processes = rebased::running_processes_in(&installation, &launchers)?;
+            (installation, processes)
+        };
+        finish_snapshot(installation, processes)
     }
 
     fn install_bridge(&self, installation: &Installation) -> Result<u64, String> {
@@ -621,6 +650,13 @@ fn read_mode(path: &Path) -> Result<Mode, String> {
 fn scan_environment() -> Result<Snapshot, String> {
     let installation = rebased::discover()?;
     let processes = rebased::running_processes(&installation)?;
+    finish_snapshot(installation, processes)
+}
+
+fn finish_snapshot(
+    installation: Installation,
+    processes: Vec<RebasedProcess>,
+) -> Result<Snapshot, String> {
     let bridge = bridge_package::inspect(&installation)?;
     let bridge_disabled = bridge_package::is_disabled_in_ide(&installation)?;
     Ok(Snapshot {
