@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
@@ -14,13 +14,18 @@ use tokio::{
     time::{sleep_until, timeout, Instant as TokioInstant},
 };
 
-use crate::{logging, worker::WorkerState};
+use crate::{
+    logging,
+    protocol::{valid_target_id, MAX_WINDOWS},
+    worker::WorkerState,
+};
 
-pub const BRIDGE_PROTOCOL: u64 = 1;
-const MAX_BRIDGE_LINE_BYTES: usize = 16 * 1024;
+pub const BRIDGE_PROTOCOL: u64 = 2;
+pub const MAX_BRIDGE_LINE_BYTES: usize = 256 * 1024;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(15);
-const HEARTBEAT: Duration = Duration::from_secs(10);
+const HEARTBEAT: Duration = Duration::from_secs(2);
+const DISCOVERY_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShowSpec {
@@ -40,6 +45,7 @@ pub enum DesiredMode {
     Hold,
     Clear,
     Show(ShowSpec),
+    Windows(BTreeMap<String, ShowSpec>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +71,18 @@ impl Desired {
                 "editor": show.editor,
                 "frame": show.frame,
             }),
+            DesiredMode::Windows(windows) => {
+                let mut map = serde_json::Map::new();
+                for (target_id, show) in windows {
+                    map.insert(target_id.clone(), show_spec_json(show));
+                }
+                json!({
+                    "type": "desired",
+                    "seq": self.seq,
+                    "mode": "windows",
+                    "windows": map,
+                })
+            }
         }
     }
 
@@ -83,6 +101,9 @@ impl Desired {
                 show.editor,
                 show.frame
             ),
+            DesiredMode::Windows(windows) => {
+                format!("#{} windows count={}", self.seq, windows.len())
+            }
         }
     }
 }
@@ -93,6 +114,7 @@ pub struct BridgeReport {
     pub ok: bool,
     pub message: String,
     pub conflicts: String,
+    pub target_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +135,7 @@ pub enum AckOutcome {
 pub struct BridgeHub {
     desired: watch::Sender<Desired>,
     sessions: Mutex<HashMap<u64, BridgeSession>>,
+    known_targets: Mutex<HashMap<u32, (Vec<String>, Instant)>>,
     changed: Condvar,
     next_session: AtomicU64,
 }
@@ -126,6 +149,7 @@ impl BridgeHub {
         Self {
             desired,
             sessions: Mutex::new(HashMap::new()),
+            known_targets: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             next_session: AtomicU64::new(1),
         }
@@ -162,6 +186,55 @@ impl BridgeHub {
             Ok(sessions) => sessions.values().cloned().collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    pub fn discovered_target_ids(&self) -> Vec<String> {
+        let Ok(sessions) = self.sessions.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut known) = self.known_targets.lock() else {
+            return Vec::new();
+        };
+        known.retain(|pid, (_, seen)| {
+            seen.elapsed() < DISCOVERY_GRACE
+                || sessions
+                    .values()
+                    .any(|session| session.pid == *pid && session.last_report.is_some())
+        });
+        let mut ids = Vec::new();
+        for (targets, _) in known.values() {
+            for id in targets {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    pub fn owner_discovery_expired(&self, target: &str) -> bool {
+        let Some(pid) = target
+            .split('-')
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        if sessions
+            .values()
+            .any(|session| session.pid == pid && session.last_report.is_some())
+        {
+            return false;
+        }
+        self.known_targets.lock().is_ok_and(|known| {
+            known
+                .get(&pid)
+                .is_none_or(|(_, seen)| seen.elapsed() >= DISCOVERY_GRACE)
+        })
     }
 
     pub fn wait_for_ack(&self, seq: u64, limit: Duration) -> AckOutcome {
@@ -214,24 +287,33 @@ impl BridgeHub {
         self.desired.subscribe()
     }
 
-    fn register(&self, session: BridgeSession) -> u64 {
+    pub(crate) fn register(&self, session: BridgeSession) -> u64 {
         let id = self.next_session.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut sessions) = self.sessions.lock() {
+            if let Some(report) = &session.last_report {
+                if let Ok(mut known) = self.known_targets.lock() {
+                    known.insert(session.pid, (report.target_ids.clone(), Instant::now()));
+                }
+            }
             sessions.insert(id, session);
         }
         self.changed.notify_all();
         id
     }
 
-    fn record_report(&self, id: u64, report: BridgeReport) {
+    pub(crate) fn record_report(&self, id: u64, report: BridgeReport) {
         let mut changed_text = None;
         if let Ok(mut sessions) = self.sessions.lock() {
             if let Some(session) = sessions.get_mut(&id) {
+                if let Ok(mut known) = self.known_targets.lock() {
+                    known.insert(session.pid, (report.target_ids.clone(), Instant::now()));
+                }
                 let previous = session.last_report.replace(report.clone());
                 let differs = previous.as_ref().is_none_or(|previous| {
                     previous.seq != report.seq
                         || previous.ok != report.ok
                         || previous.message != report.message
+                        || previous.target_ids != report.target_ids
                 });
                 if differs {
                     changed_text = Some(format!(
@@ -247,7 +329,7 @@ impl BridgeHub {
         }
     }
 
-    fn remove(&self, id: u64) {
+    pub(crate) fn remove(&self, id: u64) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(&id);
         }
@@ -421,6 +503,9 @@ async fn session_loop<W: AsyncWrite + Unpin>(
                     Some(Ok(line)) => line,
                 };
                 let report = parse_report(&line)?;
+                let pid = hub.sessions.lock().map_err(|_| "桥接会话锁失效。")?
+                    .get(&id).map(|session| session.pid).ok_or("桥接会话已关闭。")?;
+                validate_report_owner(&report, pid)?;
                 match awaiting.pop_front() {
                     Some((seq, _)) if seq == report.seq => hub.record_report(id, report),
                     expected => {
@@ -462,6 +547,9 @@ async fn session_loop<W: AsyncWrite + Unpin>(
 async fn write_json<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> Result<(), String> {
     let mut payload = serde_json::to_string(value).map_err(|error| error.to_string())?;
     payload.push('\n');
+    if payload.len() > MAX_BRIDGE_LINE_BYTES {
+        return Err("桥接消息过长。".to_string());
+    }
     writer
         .write_all(payload.as_bytes())
         .await
@@ -562,7 +650,82 @@ fn parse_report(line: &str) -> Result<BridgeReport, String> {
             .ok_or_else(|| "report 缺少 ok。".to_string())?,
         message: bounded_string(&report, "message", 2048)?,
         conflicts: bounded_string(&report, "conflicts", 1024)?,
+        target_ids: parse_target_ids(&report)?,
     })
+}
+
+fn parse_target_ids(report: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let values = report
+        .get("targetIds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "report 缺少 targetIds。".to_string())?;
+    if values.len() > MAX_WINDOWS {
+        return Err(format!("report.targetIds 超过 {MAX_WINDOWS} 个窗口上限。"));
+    }
+    let mut ids = Vec::new();
+    for value in values {
+        let id = value
+            .as_str()
+            .ok_or_else(|| "report.targetIds 必须是字符串数组。".to_string())?;
+        if !valid_target_id(id) {
+            return Err("report.targetIds 包含无效 targetId。".to_string());
+        }
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn validate_report_owner(report: &BridgeReport, pid: u32) -> Result<(), String> {
+    let prefix = format!("{pid}-");
+    if report
+        .target_ids
+        .iter()
+        .any(|target| !target.starts_with(&prefix))
+    {
+        return Err("桥接 targetId 不属于当前 Rebased 进程。".to_string());
+    }
+    Ok(())
+}
+
+fn show_spec_json(show: &ShowSpec) -> Value {
+    json!({
+        "image": show.image,
+        "opacity": show.opacity,
+        "fill": show.fill,
+        "anchor": show.anchor,
+        "textContrast": show.text_contrast,
+        "editor": show.editor,
+        "frame": show.frame,
+    })
+}
+
+pub fn windows_desired(windows: BTreeMap<String, ShowSpec>) -> Result<DesiredMode, String> {
+    if windows.len() > MAX_WINDOWS {
+        return Err(format!("独立窗口配置超过 {MAX_WINDOWS} 个上限。"));
+    }
+    for target_id in windows.keys() {
+        if !valid_target_id(target_id) {
+            return Err("独立窗口 targetId 无效。".to_string());
+        }
+    }
+    let mode = DesiredMode::Windows(windows);
+    let json = Desired {
+        seq: u64::MAX,
+        mode: mode.clone(),
+    }
+    .to_json();
+    if serde_json::to_vec(&json)
+        .map_err(|error| error.to_string())?
+        .len()
+        + 1
+        > MAX_BRIDGE_LINE_BYTES
+    {
+        return Err("窗口背景快照超过桥接消息大小上限。".to_string());
+    }
+    Ok(mode)
 }
 
 fn file_name(path: &str) -> &str {
@@ -607,19 +770,114 @@ mod tests {
 
     #[test]
     fn validates_hello_and_report() {
-        let hello = r#"{"type":"hello","bridgeProtocol":1,"bridgeVersion":"0.1.0","pid":42,"ideBuild":"RB-262.1"}"#;
+        let hello = r#"{"type":"hello","bridgeProtocol":2,"bridgeVersion":"0.1.0","pid":42,"ideBuild":"RB-262.1"}"#;
         let session = parse_hello(hello, 42).unwrap();
         assert_eq!(session.ide_build, "RB-262.1");
         assert!(parse_hello(hello, 43).unwrap_err().contains("不一致"));
-        let old = hello.replace("\"bridgeProtocol\":1", "\"bridgeProtocol\":2");
-        assert!(parse_hello(&old, 42).unwrap_err().contains("不兼容"));
+        let old = hello.replace("\"bridgeProtocol\":2", "\"bridgeProtocol\":1");
+        let error = parse_hello(&old, 42).unwrap_err();
+        assert!(error.contains("不兼容"), "{error}");
+        assert!(error.contains("加载新版桥接插件"), "{error}");
         let report = parse_report(
-            r#"{"type":"report","seq":7,"ok":false,"message":"冲突","conflicts":"全局·编辑器"}"#,
+            r#"{"type":"report","seq":7,"ok":false,"message":"冲突","conflicts":"全局·编辑器","targetIds":["42-abcdef0123456789abcdef01234567"]}"#,
         )
         .unwrap();
         assert_eq!(report.seq, 7);
         assert!(!report.ok);
-        assert!(parse_report(r#"{"type":"report","seq":7,"ok":true}"#).is_err());
+        assert_eq!(
+            report.target_ids,
+            vec!["42-abcdef0123456789abcdef01234567".to_string()]
+        );
+        assert!(
+            parse_report(r#"{"type":"report","seq":7,"ok":true,"message":"","conflicts":""}"#)
+                .is_err()
+        );
+        assert!(parse_report(
+            r#"{"type":"report","seq":7,"ok":true,"message":"","conflicts":"","targetIds":["../bad"]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn windows_desired_json_and_limits() {
+        let mut windows = BTreeMap::new();
+        windows.insert(
+            "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ShowSpec {
+                image: r"C:\media\a.png".to_string(),
+                opacity: 20,
+                fill: "SCALE",
+                anchor: "CENTER",
+                text_contrast: 50,
+                editor: true,
+                frame: true,
+            },
+        );
+        let mode = windows_desired(windows).unwrap();
+        let desired = Desired { seq: 9, mode };
+        let json = desired.to_json();
+        assert_eq!(json["mode"], "windows");
+        assert_eq!(json["seq"], 9);
+        assert_eq!(
+            json["windows"]["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["opacity"],
+            20
+        );
+        let mut too_many = BTreeMap::new();
+        for i in 0..=MAX_WINDOWS {
+            too_many.insert(
+                format!("{i}-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ShowSpec {
+                    image: "a.png".into(),
+                    opacity: 1,
+                    fill: "SCALE",
+                    anchor: "CENTER",
+                    text_contrast: 0,
+                    editor: true,
+                    frame: true,
+                },
+            );
+        }
+        assert!(windows_desired(too_many).is_err());
+        let DesiredMode::Show(oversized) = show(&"x".repeat(MAX_BRIDGE_LINE_BYTES)) else {
+            unreachable!()
+        };
+        assert!(windows_desired(BTreeMap::from([("1-window".into(), oversized)])).is_err());
+    }
+
+    #[test]
+    fn window_discovery_survives_one_process_disconnect_and_expires() {
+        let hub = BridgeHub::new(DesiredMode::Hold);
+        let report = |pid| BridgeReport {
+            seq: 1,
+            ok: true,
+            message: String::new(),
+            conflicts: String::new(),
+            target_ids: vec![format!("{pid}-window")],
+        };
+        let session = |pid| BridgeSession {
+            pid,
+            bridge_version: "test".into(),
+            ide_build: "test".into(),
+            last_report: Some(report(pid)),
+        };
+        let a = hub.register(session(1));
+        let b = hub.register(session(2));
+        hub.remove(b);
+        hub.record_report(a, report(1));
+        assert_eq!(hub.discovered_target_ids(), vec!["1-window", "2-window"]);
+        assert!(!hub.owner_discovery_expired("2-window"));
+        let reconnected = hub.register(BridgeSession {
+            last_report: None,
+            ..session(2)
+        });
+        assert_eq!(hub.discovered_target_ids(), vec!["1-window", "2-window"]);
+        hub.record_report(reconnected, report(2));
+        hub.remove(reconnected);
+        hub.known_targets.lock().unwrap().get_mut(&2).unwrap().1 = Instant::now() - DISCOVERY_GRACE;
+        assert_eq!(hub.discovered_target_ids(), vec!["1-window"]);
+        assert!(hub.owner_discovery_expired("2-window"));
+        assert!(validate_report_owner(&report(2), 1).is_err());
+        assert!(validate_report_owner(&report(2), 2).is_ok());
     }
 
     #[tokio::test]
@@ -659,7 +917,7 @@ mod tests {
         assert!(first["image"].as_str().unwrap().ends_with("first.png"));
         write_json(
             &mut bridge_write,
-            &json!({"type":"report","seq":1,"ok":true,"message":"","conflicts":""}),
+            &json!({"type":"report","seq":1,"ok":true,"message":"","conflicts":"","targetIds":["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}),
         )
         .await
         .unwrap();
@@ -670,7 +928,7 @@ mod tests {
         assert_eq!(second["seq"], seq);
         write_json(
             &mut bridge_write,
-            &json!({"type":"report","seq":seq,"ok":false,"message":"冲突","conflicts":"x"}),
+            &json!({"type":"report","seq":seq,"ok":false,"message":"冲突","conflicts":"x","targetIds":["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}),
         )
         .await
         .unwrap();
@@ -684,13 +942,20 @@ mod tests {
                 assert_eq!(reports.len(), 1);
                 assert!(!reports[0].ok);
                 assert_eq!(reports[0].message, "冲突");
+                assert_eq!(
+                    hub.discovered_target_ids(),
+                    vec![
+                        "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                        "1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+                    ]
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
 
         write_json(
             &mut bridge_write,
-            &json!({"type":"report","seq":99,"ok":true,"message":"","conflicts":""}),
+            &json!({"type":"report","seq":99,"ok":true,"message":"","conflicts":"","targetIds":[]}),
         )
         .await
         .unwrap();

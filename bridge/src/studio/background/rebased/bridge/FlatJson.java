@@ -1,10 +1,14 @@
 package studio.background.rebased.bridge;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
-/** JSON objects whose values are only strings, integers, booleans or null. */
+/** JSON objects/arrays whose leaves are strings, integers, booleans or null. Nested depth <= 16. */
 final class FlatJson {
+  static final int MAX_DEPTH = 16;
+
   private final String text;
   private int position;
 
@@ -15,7 +19,7 @@ final class FlatJson {
   static Map<String, Object> parse(String text) {
     FlatJson parser = new FlatJson(text);
     parser.skipWhitespace();
-    Map<String, Object> result = parser.readObject();
+    Map<String, Object> result = parser.readObject(1);
     parser.skipWhitespace();
     if (parser.position != text.length()) {
       throw parser.error("trailing characters");
@@ -27,31 +31,29 @@ final class FlatJson {
     if (keysAndValues.length % 2 != 0) {
       throw new IllegalArgumentException("keys and values must be paired");
     }
-    StringBuilder out = new StringBuilder("{");
+    Map<String, Object> map = new LinkedHashMap<>();
     for (int i = 0; i < keysAndValues.length; i += 2) {
-      if (i > 0) {
-        out.append(',');
+      if (!(keysAndValues[i] instanceof String key)) {
+        throw new IllegalArgumentException("JSON keys must be strings");
       }
-      writeString(out, (String)keysAndValues[i]);
-      out.append(':');
-      Object value = keysAndValues[i + 1];
-      if (value == null) {
-        out.append("null");
+      if (map.containsKey(key)) {
+        throw new IllegalArgumentException("duplicate key " + key);
       }
-      else if (value instanceof String string) {
-        writeString(out, string);
-      }
-      else if (value instanceof Boolean || value instanceof Integer || value instanceof Long) {
-        out.append(value);
-      }
-      else {
-        throw new IllegalArgumentException("unsupported JSON value: " + value.getClass().getName());
-      }
+      map.put(key, keysAndValues[i + 1]);
     }
-    return out.append('}').toString();
+    StringBuilder out = new StringBuilder();
+    writeValue(out, map, 1);
+    return out.toString();
   }
 
-  private Map<String, Object> readObject() {
+  static String stringify(Object value) {
+    StringBuilder out = new StringBuilder();
+    writeValue(out, value, 1);
+    return out.toString();
+  }
+
+  private Map<String, Object> readObject(int depth) {
+    ensureDepth(depth);
     expect('{');
     Map<String, Object> result = new LinkedHashMap<>();
     skipWhitespace();
@@ -68,7 +70,7 @@ final class FlatJson {
       if (result.containsKey(key)) {
         throw error("duplicate key " + key);
       }
-      result.put(key, readValue());
+      result.put(key, readValue(depth));
       skipWhitespace();
       char next = next();
       if (next == '}') {
@@ -80,8 +82,37 @@ final class FlatJson {
     }
   }
 
-  private Object readValue() {
+  private List<Object> readArray(int depth) {
+    ensureDepth(depth);
+    expect('[');
+    List<Object> result = new ArrayList<>();
+    skipWhitespace();
+    if (peek() == ']') {
+      position++;
+      return result;
+    }
+    while (true) {
+      skipWhitespace();
+      result.add(readValue(depth));
+      skipWhitespace();
+      char next = next();
+      if (next == ']') {
+        return result;
+      }
+      if (next != ',') {
+        throw error("expected , or ]");
+      }
+    }
+  }
+
+  private Object readValue(int parentDepth) {
     char c = peek();
+    if (c == '{') {
+      return readObject(parentDepth + 1);
+    }
+    if (c == '[') {
+      return readArray(parentDepth + 1);
+    }
     if (c == '"') {
       return readString();
     }
@@ -101,6 +132,12 @@ final class FlatJson {
       return null;
     }
     throw error("unsupported value");
+  }
+
+  private void ensureDepth(int depth) {
+    if (depth > MAX_DEPTH) {
+      throw error("nesting exceeds " + MAX_DEPTH);
+    }
   }
 
   private Long readInteger() {
@@ -160,6 +197,65 @@ final class FlatJson {
         default -> throw error("invalid escape");
       }
     }
+  }
+
+  private static void writeValue(StringBuilder out, Object value, int depth) {
+    if (value == null) {
+      out.append("null");
+      return;
+    }
+    if (value instanceof String string) {
+      writeString(out, string);
+      return;
+    }
+    if (value instanceof Boolean || value instanceof Integer || value instanceof Long) {
+      out.append(value);
+      return;
+    }
+    if (depth > MAX_DEPTH) {
+      throw new IllegalArgumentException("JSON nesting exceeds " + MAX_DEPTH);
+    }
+    if (value instanceof Map<?, ?> map) {
+      out.append('{');
+      boolean first = true;
+      for (Map.Entry<?, ?> entry : map.entrySet()) {
+        if (!(entry.getKey() instanceof String key)) {
+          throw new IllegalArgumentException("JSON object keys must be strings");
+        }
+        if (!first) {
+          out.append(',');
+        }
+        first = false;
+        writeString(out, key);
+        out.append(':');
+        writeValue(out, entry.getValue(), depth + 1);
+      }
+      out.append('}');
+      return;
+    }
+    if (value instanceof List<?> list) {
+      out.append('[');
+      for (int i = 0; i < list.size(); i++) {
+        if (i > 0) {
+          out.append(',');
+        }
+        writeValue(out, list.get(i), depth + 1);
+      }
+      out.append(']');
+      return;
+    }
+    if (value instanceof Object[] array) {
+      out.append('[');
+      for (int i = 0; i < array.length; i++) {
+        if (i > 0) {
+          out.append(',');
+        }
+        writeValue(out, array[i], depth + 1);
+      }
+      out.append(']');
+      return;
+    }
+    throw new IllegalArgumentException("unsupported JSON value: " + value.getClass().getName());
   }
 
   private static void writeString(StringBuilder out, String value) {

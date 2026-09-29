@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -14,14 +15,16 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
-    bridge_ipc::{AckOutcome, BridgeHub, BridgeReport, BridgeSession, DesiredMode, ShowSpec},
+    bridge_ipc::{
+        windows_desired, AckOutcome, BridgeHub, BridgeReport, BridgeSession, DesiredMode, ShowSpec,
+    },
     bridge_package::{self, BridgeInstall},
     fsutil::write_atomic,
     imaging, lock, logging,
     media::download_configured_media,
     models::RuntimeStatus,
     plugin::{hello_result, PLUGIN_ID, PLUGIN_PROTOCOL},
-    protocol::{parse_configure, ConfigureSpec},
+    protocol::{parse_configure, ConfigureSpec, MAX_WINDOWS},
     rebased::{self, Installation, InstallationCache, ProcessTracker, RebasedProcess},
 };
 
@@ -31,6 +34,7 @@ pub const MSG_WAITING: &str = "等待 Rebased 启动";
 pub const MSG_EXISTING: &str =
     "Rebased 已在运行，但还没有加载桥接插件；点「立即接管」会重启 Rebased 完成接管。";
 pub const MSG_ACTIVE: &str = "背景已应用到 Rebased";
+pub const MSG_NEED_INDEPENDENT: &str = "请先配置独立窗口模式。";
 pub const MSG_APPLYING: &str = "正在把背景应用到 Rebased…";
 pub const MSG_CONNECTING: &str = "Rebased 正在启动，等待桥接插件连接…";
 pub const MSG_PAUSED: &str = "已暂停 Rebased 背景";
@@ -84,9 +88,18 @@ impl Mode {
 }
 
 #[derive(Clone)]
+struct WindowConfigured {
+    #[allow(dead_code)]
+    revision: String,
+    show: ShowSpec,
+}
+
+#[derive(Clone)]
 struct Configured {
     revision: String,
     show: ShowSpec,
+    independent: bool,
+    windows: BTreeMap<String, WindowConfigured>,
 }
 
 struct Inner {
@@ -124,6 +137,9 @@ struct StatusResult {
     paused: bool,
     configured: bool,
     revision: Option<String>,
+    independent_windows: bool,
+    target_ids: Vec<String>,
+    configured_target_ids: Vec<String>,
 }
 
 pub struct WorkerState {
@@ -228,19 +244,41 @@ impl WorkerState {
     }
 
     pub fn status_value(&self) -> Result<Value, String> {
-        let (configured, revision, mode, activity, install_error) = {
+        let pruned = self.retain_discovered_windows();
+        if pruned {
+            let armed = lock(&self.inner)?.mode == Mode::Armed;
+            if armed {
+                // status 路径只推快照，不阻塞等待桥接 ack。
+                let _ = self.publish_current(false);
+                if let Ok(keep) = self.media_keep_paths() {
+                    imaging::prune(&self.media_dir, &keep);
+                }
+            }
+        }
+        let (
+            configured,
+            revision,
+            mode,
+            activity,
+            install_error,
+            independent,
+            configured_target_ids,
+        ) = {
             let inner = lock(&self.inner)?;
+            let configured_ref = inner.configured.as_ref();
             (
-                inner.configured.is_some(),
-                inner
-                    .configured
-                    .as_ref()
-                    .map(|configured| configured.revision.clone()),
+                configured_ref.is_some(),
+                configured_ref.map(|configured| configured.revision.clone()),
                 inner.mode,
                 inner.activity.clone(),
                 inner.install_error.clone(),
+                configured_ref.is_some_and(|configured| configured.independent),
+                configured_ref
+                    .map(|configured| configured.windows.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
             )
         };
+        let target_ids = self.hub.discovered_target_ids();
         let environment = lock(&self.environment)?.clone();
         let status = compute_status(&StatusInputs {
             configured,
@@ -251,31 +289,57 @@ impl WorkerState {
             sessions: &self.hub.sessions(),
             desired_seq: self.hub.current().seq,
             now: rebased::now_filetime(),
+            independent,
+            configured_windows: configured_target_ids.len(),
+            discovered_windows: target_ids.len(),
         });
         let payload = StatusResult {
             plugin_protocol: PLUGIN_PROTOCOL,
             plugin_id: PLUGIN_ID,
             version: env!("CARGO_PKG_VERSION"),
-            paused: status.phase == "paused",
+            // Host polling only checks `paused`; Restored must also stop auto configure.
+            paused: matches!(mode, Mode::Paused | Mode::Restored),
             phase: status.phase,
             message: status.message,
             active_targets: status.active_targets,
             configured,
             revision,
+            independent_windows: independent,
+            target_ids,
+            configured_target_ids,
         };
         serde_json::to_value(payload).map_err(|error| error.to_string())
     }
 
     pub async fn configure(self: &Arc<Self>, params: Value) -> Result<Value, String> {
         let spec = parse_configure(&params)?;
+        self.validate_configure_target(&spec)?;
         let bytes = download_configured_media(&spec).await?;
+        self.validate_configure_target(&spec)?;
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || state.configure_blocking(spec, bytes))
             .await
             .map_err(|error| error.to_string())?
     }
 
+    fn validate_configure_target(&self, spec: &ConfigureSpec) -> Result<(), String> {
+        if let Some(target) = &spec.target_id {
+            if !lock(&self.inner)?
+                .configured
+                .as_ref()
+                .is_some_and(|configured| configured.independent)
+            {
+                return Err(MSG_NEED_INDEPENDENT.to_string());
+            }
+            if !self.hub.discovered_target_ids().contains(target) {
+                return Err("指定的 Rebased 窗口不存在或已关闭。".to_string());
+            }
+        }
+        Ok(())
+    }
+
     fn configure_blocking(&self, spec: ConfigureSpec, bytes: Vec<u8>) -> Result<Value, String> {
+        self.validate_configure_target(&spec)?;
         let started = Instant::now();
         let rendered = imaging::render(&bytes, &spec.media.mime_type, &spec.display)?;
         let image = imaging::store(&self.media_dir, &rendered.png)?;
@@ -299,16 +363,21 @@ impl WorkerState {
         };
         let mode = {
             let mut inner = lock(&self.inner)?;
-            inner.configured = Some(Configured {
-                revision: spec.revision.clone(),
-                show: show.clone(),
-            });
+            let mut candidate = inner.configured.clone();
+            update_configured(&mut candidate, &spec, show)?;
+            // Check the complete wire snapshot before committing a single window update.
+            desired_from_configured(candidate.as_ref().unwrap())?;
+            inner.configured = candidate;
             inner.install_error = None;
             inner.mode
         };
         logging::info(&format!(
-            "configure {}：源 {} {} {} B → {} {}x{}，处理 {} ms",
+            "configure {}{}：源 {} {} {} B → {} {}x{}，处理 {} ms",
             spec.revision,
+            spec.target_id
+                .as_ref()
+                .map(|id| format!(" target={id}"))
+                .unwrap_or_default(),
             &spec.media.sha256[..12],
             spec.media.mime_type,
             spec.media.byte_size,
@@ -317,32 +386,88 @@ impl WorkerState {
             rendered.height,
             started.elapsed().as_millis()
         ));
+        let keep = self.media_keep_paths()?;
         let result = if mode == Mode::Armed {
-            let seq = self.hub.publish(DesiredMode::Show(show), false);
-            match self.hub.wait_for_ack(seq, CONFIGURE_ACK_TIMEOUT) {
-                AckOutcome::Reported(reports) => first_failure(&reports).map_or(Ok(()), Err),
-                AckOutcome::NoSession | AckOutcome::TimedOut => Ok(()),
+            match self.publish_current(false) {
+                Ok(seq) => match self.hub.wait_for_ack(seq, CONFIGURE_ACK_TIMEOUT) {
+                    AckOutcome::Reported(reports) => first_failure(&reports).map_or(Ok(()), Err),
+                    AckOutcome::NoSession | AckOutcome::TimedOut => Ok(()),
+                },
+                Err(error) => Err(error),
             }
         } else {
             Ok(())
         };
-        imaging::prune(&self.media_dir, &[image]);
+        imaging::prune(&self.media_dir, &keep);
         result?;
         self.status_value()
+    }
+
+    fn media_keep_paths(&self) -> Result<Vec<PathBuf>, String> {
+        let inner = lock(&self.inner)?;
+        let Some(configured) = inner.configured.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(configured_media_paths(configured))
+    }
+
+    fn publish_current(&self, force: bool) -> Result<u64, String> {
+        let _ = self.retain_discovered_windows();
+        let inner = lock(&self.inner)?;
+        let configured = inner
+            .configured
+            .as_ref()
+            .ok_or_else(|| MSG_UNCONFIGURED.to_string())?;
+        let mode = if inner.mode == Mode::Armed {
+            desired_from_configured(configured)?
+        } else {
+            DesiredMode::Clear
+        };
+        Ok(self.hub.publish(mode, force))
+    }
+
+    fn retain_discovered_windows(&self) -> bool {
+        let sessions = self.hub.sessions();
+        let discovered = self.hub.discovered_target_ids();
+        let Ok(mut inner) = lock(&self.inner) else {
+            return false;
+        };
+        let Some(configured) = inner.configured.as_mut() else {
+            return false;
+        };
+        if !configured.independent {
+            return false;
+        }
+        let before = configured.windows.len();
+        configured.windows.retain(|target_id, _| {
+            if discovered.iter().any(|id| id == target_id) {
+                return true;
+            }
+            if self.hub.owner_discovery_expired(target_id) {
+                return false;
+            }
+            // Only an authoritative report from this owner can close its windows.
+            // Another IDE process's heartbeat must never erase a disconnected owner's config.
+            !sessions.iter().any(|session| {
+                target_id.starts_with(&format!("{}-", session.pid)) && session.last_report.is_some()
+            })
+        });
+        before != configured.windows.len()
     }
 
     pub fn apply_blocking(&self) -> Result<Value, String> {
         let Some(_busy) = BusyGuard::acquire(&self.busy) else {
             return Err(MSG_BUSY.to_string());
         };
-        let show = lock(&self.inner)?
-            .configured
-            .as_ref()
-            .map(|configured| configured.show.clone())
-            .ok_or_else(|| MSG_UNCONFIGURED.to_string())?;
+        {
+            let inner = lock(&self.inner)?;
+            if inner.configured.is_none() {
+                return Err(MSG_UNCONFIGURED.to_string());
+            }
+        }
         self.set_mode(Mode::Armed)?;
         logging::info("apply：立即接管");
-        let seq = self.hub.publish(DesiredMode::Show(show), true);
+        let seq = self.publish_current(true)?;
         if !self.hub.sessions().is_empty() {
             match self.hub.wait_for_ack(seq, APPLY_ACK_TIMEOUT) {
                 AckOutcome::Reported(reports) => {
@@ -711,6 +836,74 @@ fn wait_until(
     }
 }
 
+fn update_configured(
+    configured: &mut Option<Configured>,
+    spec: &ConfigureSpec,
+    show: ShowSpec,
+) -> Result<(), String> {
+    if let Some(target_id) = &spec.target_id {
+        let current = configured
+            .as_mut()
+            .filter(|item| item.independent)
+            .ok_or_else(|| MSG_NEED_INDEPENDENT.to_string())?;
+        if current.windows.len() >= MAX_WINDOWS && !current.windows.contains_key(target_id) {
+            return Err(format!("独立窗口配置超过 {MAX_WINDOWS} 个上限。"));
+        }
+        current.windows.insert(
+            target_id.clone(),
+            WindowConfigured {
+                revision: spec.revision.clone(),
+                show,
+            },
+        );
+        return Ok(());
+    }
+    let windows = configured
+        .as_mut()
+        .filter(|item| item.independent && spec.independent_windows)
+        .map(|item| std::mem::take(&mut item.windows))
+        .unwrap_or_default();
+    *configured = Some(Configured {
+        revision: spec.revision.clone(),
+        show,
+        independent: spec.independent_windows,
+        windows: if spec.independent_windows {
+            windows
+        } else {
+            BTreeMap::new()
+        },
+    });
+    Ok(())
+}
+
+fn desired_from_configured(configured: &Configured) -> Result<DesiredMode, String> {
+    if configured.independent {
+        // Full snapshot: discovered targets missing from this map are cleared by the bridge.
+        let mut windows = BTreeMap::new();
+        for (target_id, window) in &configured.windows {
+            windows.insert(target_id.clone(), window.show.clone());
+        }
+        windows_desired(windows)
+    } else {
+        Ok(DesiredMode::Show(configured.show.clone()))
+    }
+}
+
+fn configured_media_paths(configured: &Configured) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut push = |image: &str| {
+        let path = PathBuf::from(image);
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    };
+    push(&configured.show.image);
+    for window in configured.windows.values() {
+        push(&window.show.image);
+    }
+    paths
+}
+
 fn first_failure(reports: &[BridgeReport]) -> Option<String> {
     reports
         .iter()
@@ -733,6 +926,9 @@ struct StatusInputs<'a> {
     sessions: &'a [BridgeSession],
     desired_seq: u64,
     now: u64,
+    independent: bool,
+    configured_windows: usize,
+    discovered_windows: usize,
 }
 
 fn compute_status(inputs: &StatusInputs<'_>) -> RuntimeStatus {
@@ -764,6 +960,17 @@ fn compute_status(inputs: &StatusInputs<'_>) -> RuntimeStatus {
             .filter(|report| report.seq >= inputs.desired_seq)
             .count() as u32;
         if acknowledged > 0 {
+            if inputs.independent && inputs.configured_windows == 0 && inputs.discovered_windows > 0
+            {
+                return RuntimeStatus::new(
+                    "active",
+                    format!(
+                        "已发现 {} 个项目窗口，等待宿主分配独立背景",
+                        inputs.discovered_windows
+                    ),
+                    acknowledged,
+                );
+            }
             return RuntimeStatus::new("active", MSG_ACTIVE, acknowledged);
         }
         return RuntimeStatus::new("applying", MSG_APPLYING, 0);
@@ -857,6 +1064,7 @@ mod tests {
                 ok,
                 message: message.to_string(),
                 conflicts: String::new(),
+                target_ids: Vec::new(),
             }),
         }
     }
@@ -875,6 +1083,9 @@ mod tests {
             sessions,
             desired_seq: 5,
             now: 1_000 * SECOND,
+            independent: false,
+            configured_windows: 0,
+            discovered_windows: 0,
         })
     }
 
@@ -972,6 +1183,9 @@ mod tests {
             sessions: &[],
             desired_seq: 1,
             now: 0,
+            independent: false,
+            configured_windows: 0,
+            discovered_windows: 0,
         });
         assert_eq!(unconfigured.message, MSG_UNCONFIGURED);
         let busy = compute_status(&StatusInputs {
@@ -983,6 +1197,9 @@ mod tests {
             sessions: &[],
             desired_seq: 1,
             now: 0,
+            independent: false,
+            configured_windows: 0,
+            discovered_windows: 0,
         });
         assert_eq!(busy.phase, "applying");
     }
@@ -1042,17 +1259,165 @@ mod tests {
             (Some("paused"), Some(true))
         );
         assert_eq!(state.hub.current().mode, DesiredMode::Clear);
+        // A configure/status publication that was queued before pause must not re-arm it.
+        state.publish_current(true).unwrap();
+        assert_eq!(state.hub.current().mode, DesiredMode::Clear);
         let reloaded = WorkerState::load_from(dir.clone()).unwrap();
         assert_eq!(reloaded.hub.current().mode, DesiredMode::Clear);
         assert_eq!(reloaded.status_value().unwrap()["phase"], "paused");
 
         let restored = state.restore_blocking().unwrap();
         assert_eq!(restored["message"], MSG_RESTORED);
-        assert_eq!(restored["paused"], false);
+        assert_eq!(restored["paused"], true);
 
         let shutdown = state.shutdown().unwrap();
         assert_eq!(shutdown, json!({ "shutdown": true, "keptTarget": true }));
         assert!(state.is_shutting_down());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn independent_window_configs_are_atomic_and_publish_full_snapshot() {
+        let dir = temp_dir();
+        let state = WorkerState::load_from(dir.clone()).unwrap();
+        let bytes_a = png([1, 2, 3]);
+        let bytes_b = png([4, 5, 6]);
+        let mut base = configure_spec(&bytes_a, json!({ "opacity": 0.2 }));
+        base.independent_windows = true;
+        state
+            .configure_blocking(base.clone(), bytes_a.clone())
+            .unwrap();
+        match state.hub.current().mode {
+            DesiredMode::Windows(windows) => assert!(windows.is_empty()),
+            other => panic!("expected empty windows snapshot, got {other:?}"),
+        }
+
+        let id = state.hub.register(BridgeSession {
+            pid: 1,
+            bridge_version: "test".into(),
+            ide_build: "test".into(),
+            last_report: Some(BridgeReport {
+                seq: u64::MAX,
+                ok: true,
+                message: String::new(),
+                conflicts: String::new(),
+                target_ids: vec![
+                    "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    "1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                ],
+            }),
+        });
+
+        let mut targeted = base.clone();
+        targeted.target_id = Some("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        targeted.revision = "win-a".into();
+        let mut unknown = targeted.clone();
+        unknown.target_id = Some("9-unknown".into());
+        assert!(state
+            .configure_blocking(unknown, bytes_a.clone())
+            .unwrap_err()
+            .contains("不存在"));
+        state
+            .configure_blocking(targeted.clone(), bytes_a.clone())
+            .unwrap();
+
+        targeted.target_id = Some("1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        targeted.revision = "win-b".into();
+        let status = state.configure_blocking(targeted, bytes_b.clone()).unwrap();
+        assert_eq!(status["independentWindows"], true);
+        assert_eq!(status["configuredTargetIds"].as_array().unwrap().len(), 2);
+
+        let DesiredMode::Windows(windows) = state.hub.current().mode.clone() else {
+            panic!("expected windows mode");
+        };
+        assert_eq!(windows.len(), 2);
+        let path_a = windows["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].image.clone();
+        let path_b = windows["1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"].image.clone();
+        assert_ne!(path_a, path_b);
+        assert!(Path::new(&path_a).is_file());
+        assert!(Path::new(&path_b).is_file());
+
+        // Base update preserves assigned windows.
+        let mut base2 = configure_spec(&bytes_b, json!({ "opacity": 0.4 }));
+        base2.independent_windows = true;
+        base2.revision = "base-2".into();
+        state.configure_blocking(base2, bytes_b.clone()).unwrap();
+        let DesiredMode::Windows(windows) = state.hub.current().mode.clone() else {
+            panic!("expected windows mode after base update");
+        };
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"].image, path_a);
+
+        // Closed-window prune from live reports releases configs and republishes snapshot.
+        state.hub.record_report(
+            id,
+            BridgeReport {
+                seq: state.hub.current().seq,
+                ok: true,
+                message: String::new(),
+                conflicts: String::new(),
+                target_ids: vec!["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()],
+            },
+        );
+        let status = state.status_value().unwrap();
+        assert_eq!(
+            status["configuredTargetIds"],
+            json!(["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        );
+        let DesiredMode::Windows(windows) = state.hub.current().mode.clone() else {
+            panic!("expected pruned windows snapshot");
+        };
+        assert_eq!(windows.len(), 1);
+        assert!(windows.contains_key("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+
+        // Another process reporting while this one reconnects must not erase its selection.
+        let other = state.hub.register(BridgeSession {
+            pid: 2,
+            bridge_version: "test".into(),
+            ide_build: "test".into(),
+            last_report: Some(BridgeReport {
+                seq: u64::MAX,
+                ok: true,
+                message: String::new(),
+                conflicts: String::new(),
+                target_ids: vec!["2-window".into()],
+            }),
+        });
+        state.hub.remove(id);
+        let status = state.status_value().unwrap();
+        assert_eq!(
+            status["configuredTargetIds"],
+            json!(["1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        );
+        assert!(status["targetIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")));
+        state.hub.remove(other);
+
+        // Targeted configure before independent mode fails.
+        let mut orphan = configure_spec(&bytes_a, json!({}));
+        orphan.independent_windows = true;
+        orphan.target_id = Some("1-cccccccccccccccccccccccccccccccc".into());
+        let mut empty = None;
+        assert_eq!(
+            update_configured(
+                &mut empty,
+                &orphan,
+                ShowSpec {
+                    image: "x".into(),
+                    opacity: 1,
+                    fill: "SCALE",
+                    anchor: "CENTER",
+                    text_contrast: 0,
+                    editor: true,
+                    frame: true,
+                }
+            )
+            .unwrap_err(),
+            MSG_NEED_INDEPENDENT
+        );
+
         let _ = fs::remove_dir_all(dir);
     }
 

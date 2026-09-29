@@ -31,6 +31,7 @@ pub struct PluginCapabilities {
     pub loopback_media_only: bool,
     pub keeps_target_on_shutdown: bool,
     pub max_media_bytes: u64,
+    pub per_window_media: bool,
 }
 
 pub const CAPABILITIES: PluginCapabilities = PluginCapabilities {
@@ -49,6 +50,7 @@ pub const CAPABILITIES: PluginCapabilities = PluginCapabilities {
     loopback_media_only: true,
     keeps_target_on_shutdown: true,
     max_media_bytes: crate::protocol::MAX_MEDIA_BYTES,
+    per_window_media: true,
 };
 
 pub fn hello_result() -> Value {
@@ -76,6 +78,7 @@ mod tests {
             manifest["capabilities"]["maxMediaBytes"],
             crate::protocol::MAX_MEDIA_BYTES
         );
+        assert_eq!(manifest["capabilities"]["perWindowMedia"], true);
         let properties = manifest["settingsSchema"]["properties"]
             .as_object()
             .expect("settings properties");

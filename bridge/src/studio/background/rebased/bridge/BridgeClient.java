@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 final class BridgeClient implements Runnable {
   static final String PIPE_NAME = "\\\\.\\pipe\\background-studio-rebased-bridge";
-  static final int BRIDGE_PROTOCOL = 1;
+  static final int BRIDGE_PROTOCOL = 2;
 
   private static final long RETRY_MILLIS = 3_000;
   private static final long REJECTED_RETRY_MILLIS = 30_000;
@@ -105,8 +105,9 @@ final class BridgeClient implements Runnable {
         "type", "report",
         "seq", seq,
         "ok", result.ok(),
-        "message", result.message(),
-        "conflicts", result.conflicts()
+        "message", bounded(result.message(), 2048),
+        "conflicts", bounded(result.conflicts(), 1024),
+        "targetIds", applier.targetIds()
       ));
     }
   }
@@ -118,6 +119,11 @@ final class BridgeClient implements Runnable {
     catch (RuntimeException e) {
       return "unknown";
     }
+  }
+
+  private static String bounded(String text, int maximum) {
+    int count = text.codePointCount(0, text.length());
+    return count <= maximum ? text : text.substring(0, text.offsetByCodePoints(0, maximum - 1)) + "…";
   }
 
   private static void sleep(long millis) {

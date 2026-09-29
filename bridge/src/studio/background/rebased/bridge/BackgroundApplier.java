@@ -59,14 +59,19 @@ final class BackgroundApplier {
   private final String originalEditor = System.getProperty(EDITOR_PROPERTY);
   private final String originalFrame = System.getProperty(FRAME_PROPERTY);
   private final TextContrast textContrast = new TextContrast();
+  private final WindowBackgrounds windows = new WindowBackgrounds();
+
+  List<String> targetIds() { return windows.targetIds(); }
 
   Result apply(Map<String, Object> desired) {
     Object mode = desired.get("mode");
     if ("hold".equals(mode)) {
-      return Result.success();
+      return onEdt(Result::success);
     }
     if ("clear".equals(mode)) {
+      windows.forgetPrepared();
       return onEdt(() -> {
+        windows.clear();
         boolean changed = set(EDITOR_PROPERTY, originalEditor) | set(FRAME_PROPERTY, originalFrame);
         if (changed) {
           IdeBackgroundUtil.resetBackgroundImagePainters();
@@ -76,9 +81,20 @@ final class BackgroundApplier {
         return Result.success();
       });
     }
+    if ("windows".equals(mode)) {
+      Map<String, WindowBackgrounds.Spec> prepared;
+      try { prepared = windows.prepare(desired.get("windows")); }
+      catch (IllegalArgumentException error) { return Result.failure(error.getMessage()); }
+      return onEdt(() -> {
+        boolean changed = set(EDITOR_PROPERTY, originalEditor) | set(FRAME_PROPERTY, originalFrame);
+        if (changed) { IdeBackgroundUtil.resetBackgroundImagePainters(); }
+        return conflictResult(windows.apply(prepared, textContrast));
+      });
+    }
     if (!"show".equals(mode)) {
       return Result.failure("桥接插件收到未知的 mode：" + mode);
     }
+    windows.forgetPrepared();
 
     String spec;
     int contrast;
@@ -94,6 +110,7 @@ final class BackgroundApplier {
       return Result.failure(e.getMessage());
     }
     return onEdt(() -> {
+      windows.clear();
       boolean changed = set(EDITOR_PROPERTY, editor ? spec : originalEditor)
                         | set(FRAME_PROPERTY, frame ? spec : originalFrame);
       if (changed) {
@@ -102,21 +119,22 @@ final class BackgroundApplier {
       }
       // Only the editor painter puts the image under editor text.
       textContrast.apply(editor ? contrast : 0);
-      List<String> conflicts = findUserBackgrounds(editor, frame);
-      if (conflicts.isEmpty()) {
-        return Result.success();
-      }
-      String joined = String.join("；", conflicts);
-      return new Result(
+      return conflictResult(findUserBackgrounds(editor, frame));
+    });
+  }
+
+  private static Result conflictResult(List<String> conflicts) {
+    if (conflicts.isEmpty()) { return Result.success(); }
+    String joined = String.join("；", conflicts);
+    return new Result(
         false,
         "Rebased 里已经用 Set Background Image 设置了背景（" + joined + "），它会盖住插件背景。"
         + "请在 Rebased 中按 Ctrl+Shift+A 搜索 Set Background Image，清除后再试。",
         joined
-      );
-    });
+    );
   }
 
-  private static String buildSpec(Map<String, Object> desired) {
+  static String buildSpec(Map<String, Object> desired) {
     File image = requireMediaFile(desired.get("image"));
     Object opacity = desired.get("opacity");
     if (!(opacity instanceof Long value) || value < 0 || value > 100) {
@@ -183,7 +201,7 @@ final class BackgroundApplier {
     }
   }
 
-  private static int requirePercent(Map<String, Object> desired, String key) {
+  static int requirePercent(Map<String, Object> desired, String key) {
     Object value = desired.get(key);
     if (!(value instanceof Long percent) || percent < 0 || percent > 100) {
       throw new IllegalArgumentException(key + " 必须是 0-100 的整数。");
@@ -191,7 +209,7 @@ final class BackgroundApplier {
     return percent.intValue();
   }
 
-  private static boolean requireBoolean(Map<String, Object> desired, String key) {
+  static boolean requireBoolean(Map<String, Object> desired, String key) {
     Object value = desired.get(key);
     if (!(value instanceof Boolean flag)) {
       throw new IllegalArgumentException(key + " 必须是布尔值。");
@@ -238,14 +256,16 @@ final class BackgroundApplier {
     return value != null && !value.isEmpty();
   }
 
-  private static Result onEdt(Supplier<Result> task) {
+  private Result onEdt(Supplier<Result> task) {
     Application application = ApplicationManager.getApplication();
     if (application == null) {
       return Result.failure("Rebased 应用尚未初始化。");
     }
     CompletableFuture<Result> future = new CompletableFuture<>();
     application.invokeLater(() -> {
+      if (future.isDone()) { return; }
       try {
+        windows.discover();
         future.complete(task.get());
       }
       catch (Throwable t) {
@@ -257,9 +277,11 @@ final class BackgroundApplier {
       return future.get(EDT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
     catch (TimeoutException e) {
+      future.cancel(false);
       return Result.failure("Rebased 界面线程 " + EDT_TIMEOUT_SECONDS + " 秒内没有响应。");
     }
     catch (InterruptedException e) {
+      future.cancel(false);
       Thread.currentThread().interrupt();
       return Result.failure("桥接插件线程被中断。");
     }

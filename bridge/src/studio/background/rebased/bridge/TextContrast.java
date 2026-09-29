@@ -15,9 +15,13 @@ import com.intellij.openapi.editor.event.EditorFactoryEvent;
 import com.intellij.openapi.editor.event.EditorFactoryListener;
 import com.intellij.openapi.editor.ex.EditorEx;
 import com.intellij.openapi.editor.markup.TextAttributes;
+import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 
 import java.awt.Color;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -30,6 +34,8 @@ final class TextContrast {
   private static final Logger LOG = Logger.getInstance(TextContrast.class);
 
   private volatile float factor;
+  private volatile boolean globalMode;
+  private volatile Map<Project, Float> projectFactors = Map.of();
   private Disposable listeners;
 
   void apply(int percent) {
@@ -38,8 +44,10 @@ final class TextContrast {
       return;
     }
     float next = percent / 100f;
-    boolean changed = next != factor;
+    boolean changed = !globalMode || next != factor;
+    globalMode = true;
     factor = next;
+    projectFactors = Map.of();
     listen();
     int wrapped = 0;
     int refreshed = 0;
@@ -63,13 +71,82 @@ final class TextContrast {
     }
   }
 
+  /** Per-project contrast. Projects absent from the map (or <=0) are unwrapped. */
+  void apply(Map<Project, Integer> percents) {
+    Map<Project, Float> next = new IdentityHashMap<>();
+    if (percents != null) {
+      for (Map.Entry<Project, Integer> entry : percents.entrySet()) {
+        Project project = entry.getKey();
+        Integer percent = entry.getValue();
+        if (project == null || percent == null || percent <= 0) {
+          continue;
+        }
+        next.put(project, percent / 100f);
+      }
+    }
+    if (next.isEmpty()) {
+      clear();
+      return;
+    }
+    Map<Project, Float> previous = projectFactors;
+    boolean wasGlobal = globalMode;
+    float previousGlobal = factor;
+    globalMode = false;
+    factor = 0;
+    projectFactors = Collections.unmodifiableMap(next);
+    listen();
+    int wrapped = 0;
+    int refreshed = 0;
+    int restored = 0;
+    for (Editor editor : EditorFactory.getInstance().getAllEditors()) {
+      if (!(editor instanceof EditorEx ex) || ex.isDisposed()) {
+        continue;
+      }
+      Project project = ex.getProject();
+      float wanted = factorFor(project);
+      float previousWanted = wasGlobal ? previousGlobal : previousFactor(previous, project);
+      if (wanted <= 0) {
+        if (unwrap(ex)) {
+          restored++;
+        }
+        continue;
+      }
+      if (liftedScheme(ex) == null) {
+        wrap(ex);
+        wrapped++;
+      }
+      else if (wanted != previousWanted) {
+        // Only reinit editors whose project factor actually changed.
+        ex.reinitSettings();
+        ex.getContentComponent().repaint();
+        refreshed++;
+      }
+    }
+    if (wrapped > 0 || refreshed > 0 || restored > 0) {
+      LOG.info("Background Studio per-project text contrast: wrapped " + wrapped
+               + ", refreshed " + refreshed + ", cleared " + restored);
+    }
+  }
+
+  private static float previousFactor(Map<Project, Float> previous, Project project) {
+    if (project == null) {
+      return 0f;
+    }
+    Float value = previous.get(project);
+    return value == null ? 0f : value.floatValue();
+  }
+
   void clear() {
-    if (listeners == null) {
+    if (listeners == null && factor <= 0 && projectFactors.isEmpty()) {
       return;
     }
     factor = 0;
-    Disposer.dispose(listeners);
-    listeners = null;
+    globalMode = false;
+    projectFactors = Map.of();
+    if (listeners != null) {
+      Disposer.dispose(listeners);
+      listeners = null;
+    }
     int restored = 0;
     for (Editor editor : EditorFactory.getInstance().getAllEditors()) {
       if (editor instanceof EditorEx ex && !ex.isDisposed() && unwrap(ex)) {
@@ -77,6 +154,17 @@ final class TextContrast {
       }
     }
     LOG.info("Background Studio text contrast cleared: restored " + restored + " editor(s)");
+  }
+
+  private float factorFor(Project project) {
+    if (globalMode) {
+      return factor;
+    }
+    if (project == null) {
+      return 0;
+    }
+    Float value = projectFactors.get(project);
+    return value == null ? 0f : value;
   }
 
   private void listen() {
@@ -90,7 +178,11 @@ final class TextContrast {
         Editor editor = event.getEditor();
         // Creators often install their own scheme right after the editor is built.
         ApplicationManager.getApplication().invokeLater(() -> {
-          if (factor > 0 && editor instanceof EditorEx ex && !ex.isDisposed() && liftedScheme(ex) == null) {
+          if (!(editor instanceof EditorEx ex) || ex.isDisposed()) {
+            return;
+          }
+          float wanted = factorFor(ex.getProject());
+          if (wanted > 0 && liftedScheme(ex) == null) {
             wrap(ex);
           }
         }, ModalityState.any());
@@ -105,21 +197,38 @@ final class TextContrast {
 
   /** The wrapped schemes keep pointing at the old global scheme after a theme switch. */
   private void rewrapAll() {
-    if (factor <= 0) {
+    if (globalMode) {
+      if (factor <= 0) {
+        return;
+      }
+    }
+    else if (projectFactors.isEmpty()) {
       return;
     }
     int rewrapped = 0;
+    int restored = 0;
     for (Editor editor : EditorFactory.getInstance().getAllEditors()) {
-      if (editor instanceof EditorEx ex && !ex.isDisposed() && unwrap(ex)) {
+      if (!(editor instanceof EditorEx ex) || ex.isDisposed()) {
+        continue;
+      }
+      float wanted = factorFor(ex.getProject());
+      if (wanted <= 0) {
+        if (unwrap(ex)) {
+          restored++;
+        }
+        continue;
+      }
+      if (unwrap(ex) || liftedScheme(ex) == null) {
         wrap(ex);
         rewrapped++;
       }
     }
-    LOG.info("Background Studio text contrast followed a colour scheme change: " + rewrapped + " editor(s)");
+    LOG.info("Background Studio text contrast followed a colour scheme change: rewrapped "
+             + rewrapped + ", cleared " + restored);
   }
 
   private void wrap(EditorEx editor) {
-    editor.setColorsScheme(new LiftedScheme(editor.getColorsScheme(), this));
+    editor.setColorsScheme(new LiftedScheme(editor.getColorsScheme(), this, editor.getProject()));
     editor.getContentComponent().repaint();
   }
 
@@ -166,18 +275,24 @@ final class TextContrast {
     }
 
     private final TextContrast owner;
+    private final Project project;
     private final ConcurrentHashMap<TextAttributesKey, LiftedAttributes> attributes = new ConcurrentHashMap<>();
     private volatile LiftedColor foreground;
 
-    LiftedScheme(EditorColorsScheme delegate, TextContrast owner) {
+    LiftedScheme(EditorColorsScheme delegate, TextContrast owner, Project project) {
       super(delegate);
       this.owner = owner;
+      this.project = project;
+    }
+
+    private float currentFactor() {
+      return owner.factorFor(project);
     }
 
     @Override
     public TextAttributes getAttributes(TextAttributesKey key) {
       TextAttributes source = super.getAttributes(key);
-      float factor = owner.factor;
+      float factor = currentFactor();
       if (source == null || factor <= 0 || source.getForegroundColor() == null) {
         return source;
       }
@@ -195,7 +310,7 @@ final class TextContrast {
     @Override
     public Color getDefaultForeground() {
       Color source = super.getDefaultForeground();
-      float factor = owner.factor;
+      float factor = currentFactor();
       if (source == null || factor <= 0) {
         return source;
       }

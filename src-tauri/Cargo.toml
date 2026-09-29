@@ -1,6 +1,6 @@
 [package]
 name = "rebased-background-studio"
-version = "0.1.2-beta.1"
+version = "0.1.2-beta.2"
 description = "A headless Background Studio worker for the Rebased git client."
 authors = ["Rebased Background Studio contributors"]
 license = "MIT"

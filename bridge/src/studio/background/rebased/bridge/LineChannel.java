@@ -13,7 +13,7 @@ import java.nio.charset.StandardCharsets;
  * one thread: a pending synchronous read blocks writes on the same handle.
  */
 final class LineChannel {
-  static final int MAX_LINE_BYTES = 64 * 1024;
+  static final int MAX_LINE_BYTES = 256 * 1024;
 
   private final RandomAccessFile pipe;
   private final byte[] buffer = new byte[8192];

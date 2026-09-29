@@ -11,7 +11,8 @@
     "autoTakeover": true,
     "hotUpdate": true,
     "keepsTargetOnShutdown": true,
-    "maxMediaBytes": 67108864
+    "maxMediaBytes": 67108864,
+    "perWindowMedia": true
   },
   "settingsSchema": {
     "type": "object",

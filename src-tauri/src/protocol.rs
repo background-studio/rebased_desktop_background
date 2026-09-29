@@ -11,6 +11,8 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_REVISION_CHARS: usize = 128;
 pub const MAX_URL_CHARS: usize = 2048;
+pub const MAX_TARGET_ID_CHARS: usize = 64;
+pub const MAX_WINDOWS: usize = 128;
 
 pub const DISPLAY_KEYS: &[&str] = &[
     "fit",
@@ -45,6 +47,8 @@ pub struct ConfigureSpec {
     pub revision: String,
     pub media: MediaSpec,
     pub display: DisplaySettings,
+    pub independent_windows: bool,
+    pub target_id: Option<String>,
 }
 
 pub fn parse_request_line(line: &str) -> Result<PluginRequest, String> {
@@ -124,6 +128,19 @@ pub fn parse_configure(params: &Value) -> Result<ConfigureSpec, String> {
         .get("display")
         .ok_or_else(|| "configure 缺少 display。".to_string())?;
     let display = validate_display(display)?;
+    let independent_windows = match params.get("independentWindows") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err("independentWindows 必须是布尔值。".to_string()),
+    };
+    let target_id = match params.get("targetId") {
+        None => None,
+        Some(Value::String(id)) if independent_windows && valid_target_id(id) => Some(id.clone()),
+        Some(Value::String(_)) if !independent_windows => {
+            return Err("targetId 无效或未启用独立窗口模式。".to_string());
+        }
+        _ => return Err("targetId 无效或未启用独立窗口模式。".to_string()),
+    };
     Ok(ConfigureSpec {
         revision: revision.to_string(),
         media: MediaSpec {
@@ -133,7 +150,17 @@ pub fn parse_configure(params: &Value) -> Result<ConfigureSpec, String> {
             byte_size,
         },
         display: DisplaySettings::from_validated(display),
+        independent_windows,
+        target_id,
     })
+}
+
+pub fn valid_target_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_TARGET_ID_CHARS
+        && id
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_')
 }
 
 pub fn validate_configure_url(value: &str) -> Result<Url, String> {
@@ -389,5 +416,35 @@ mod tests {
         too_big["byteSize"] = json!(MAX_MEDIA_BYTES + 1);
         assert!(parse_configure(&configure_with(too_big, json!({}))).is_err());
         assert!(parse_configure(&json!({})).is_err());
+    }
+    #[test]
+    fn validates_targeted_configure_without_changing_legacy_default() {
+        let mut params = configure_with(image_media(), json!({}));
+        assert!(!parse_configure(&params).unwrap().independent_windows);
+        assert!(parse_configure(&params).unwrap().target_id.is_none());
+        params["targetId"] = json!("1234-abcdef0123456789abcdef01234567");
+        assert!(parse_configure(&params).is_err());
+        params["independentWindows"] = json!(true);
+        let spec = parse_configure(&params).unwrap();
+        assert!(spec.independent_windows);
+        assert_eq!(
+            spec.target_id.as_deref(),
+            Some("1234-abcdef0123456789abcdef01234567")
+        );
+        for target in [
+            json!(""),
+            json!("../other"),
+            json!(1),
+            json!("a".repeat(65)),
+            json!("bad id"),
+        ] {
+            params["targetId"] = target;
+            assert!(parse_configure(&params).is_err());
+        }
+        params.as_object_mut().unwrap().remove("targetId");
+        params["independentWindows"] = json!("true");
+        assert!(parse_configure(&params).is_err());
+        params["independentWindows"] = json!(true);
+        assert!(parse_configure(&params).unwrap().target_id.is_none());
     }
 }

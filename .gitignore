@@ -1,3 +1,4 @@
 *.log
 src-tauri/target/
 build/
+.bce-tool/

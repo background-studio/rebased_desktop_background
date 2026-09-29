@@ -7,25 +7,28 @@ import com.intellij.openapi.editor.markup.TextAttributes;
 import java.awt.Color;
 
 public class DelegateColorScheme implements EditorColorsScheme {
+  private final EditorColorsScheme delegate;
+
   public DelegateColorScheme(EditorColorsScheme delegate) {
+    this.delegate = delegate;
   }
 
   public EditorColorsScheme getDelegate() {
-    throw new UnsupportedOperationException("compile-only stub");
+    return delegate;
   }
 
   @Override
   public TextAttributes getAttributes(TextAttributesKey key) {
-    throw new UnsupportedOperationException("compile-only stub");
+    return delegate.getAttributes(key);
   }
 
   @Override
   public Color getDefaultForeground() {
-    throw new UnsupportedOperationException("compile-only stub");
+    return delegate.getDefaultForeground();
   }
 
   @Override
   public Color getDefaultBackground() {
-    throw new UnsupportedOperationException("compile-only stub");
+    return delegate.getDefaultBackground();
   }
 }

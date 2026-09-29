@@ -12,7 +12,7 @@
 
 一个面向 Windows 上 [Rebased](https://github.com/DetachHead/rebased)（基于 IntelliJ
 平台的 Git 客户端）的可逆背景插件。背景通过 IntelliJ 自带的背景图绘制器显示，
-只用运行时的 JVM 系统属性，不写 Rebased 的设置，不改 Rebased 的安装目录。
+只使用运行时绘制器（旧宿主使用 JVM 系统属性），不写 Rebased 的设置，不改 Rebased 的安装目录。
 
 > 非 Rebased 官方产品。Rebased 归其作者所有；IntelliJ 是 JetBrains s.r.o. 的商标。
 
@@ -23,19 +23,29 @@
 - 配置好背景后，worker 把桥接插件 `Background Studio Bridge` 放进 Rebased 的插件目录
   （例如 `%APPDATA%\detachhead\IdeaIC1.1\plugins\background-studio-bridge`）。
 - Rebased 启动后，桥接插件通过本机 Named Pipe 连上 worker（worker 会核对对方确实是
-  Rebased 进程），拿到图片后设置 `idea.background.editor` / `idea.background.frame` 并重绘。
-- 这两个属性只活在 Rebased 进程里：关掉 Rebased 就没了，下次启动由桥接插件重新向
-  worker 要。
+  Rebased 进程），上报打开的项目窗口；壳分别选图后，桥接将图片挂到各窗口自己的
+  `idea.background.editor` / `idea.background.frame` 原生绘制器上。
+- 窗口 ID 和绘制器只活在 Rebased 进程里，关闭窗口会释放；不会将背景写进项目设置。
+  旧宿主没有协商独立窗口时仍使用原来的单媒体模式。
 
 ## 功能
 
 - 由壳 `configure` 下发回环媒体 URL 和显示参数，热更新已连接的 Rebased
+- 多项目窗口独立背景与轮播：通过 `perWindowMedia` 接入壳的逐窗口随机/顺序选图和计时，
+  图片充足时优先避开其他窗口的图片；打开新窗口不改变旧窗口的选择。需支持独立窗口的宿主
+  和新版桥接同时生效；欢迎页不作为项目窗口。桥接约每 2 秒上报窗口，壳约每 2 秒分配媒体。
 - 覆盖、原始尺寸、平铺；九宫格对齐
 - 背景不透明度、模糊、遮罩颜色与强度
 - 文字对比度增强：背景图会把字底下的底色提亮，显示背景时桥接插件在内存里把编辑器文字
   颜色往远离底色的方向推（深色主题调亮、浅色主题调暗），色相和饱和度不变；只作用于编辑器
   文字，不改 Rebased 的配色方案，暂停或恢复时一起撤掉
 - 分别控制「编辑器与面板」（Log、提交等大部分界面）和「空编辑区」
+- 兼容 Islands 主题的面板背景限制和表格单元格绘制：Log 主体也显示窗口独立背景，
+  不只覆盖外围；暂停/恢复会撤销窗口级绘制变换，并还原主题的原始背景限制。
+- 显示背景时去除 Islands 区块边缘额外的深色填充，保留主题原有细分界线和圆角；
+  普通面板的实色底色在合成图片前统一为窗口底色，区块内边距先重置底色再绘制一次背景，
+  不叠加阴影遮罩；文字、线条、输入控件及非普通底色的选中行不改色。不修改全局主题颜色，
+  暂停/恢复原始外观时撤销绘制变换并还原区块绘制器。
 - 配置后自动接管新启动的 Rebased；`apply` 可重启已在运行、还没加载桥接的 Rebased
 - 一键暂停或恢复原始外观，状态跨 worker 重启保留；`shutdown` 保留当前背景
 
@@ -43,6 +53,9 @@
 
 ## 使用须知
 
+- **从旧版升级后需要重启 Rebased，才能加载新版桥接。** worker 不会静默关闭现有窗口；
+  可手动退出 Rebased 后等待桥接更新再打开，或在壳里使用「立即接管」。仅更新 worker
+  不能让已经加载的旧桥接支持多窗口。
 - **第一次接管需要重启 Rebased。** IntelliJ 平台只在启动时加载插件。点「立即接管」时
   worker 会发送普通的关闭请求（等同点窗口的关闭按钮，不会强杀），装好桥接后重新打开
   Rebased。如果 Rebased 弹出「Confirm Exit」，点 Exit 即可；勾选 *Don't ask again*
@@ -68,6 +81,8 @@ worker 自己的数据都在 `%LOCALAPPDATA%\RebasedBackgroundStudio\`：`state.
 $env:JAVA_HOME = 'D:\Rebased\jbr'
 cargo fmt --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
+./bridge/tests/Run-BridgeUnitTests.ps1 -JdkHome $env:JAVA_HOME -WindowTests
+./bridge/tests/Run-NativePainterApiTest.ps1 -RebasedHome 'D:\Rebased'
 cargo build --release --manifest-path src-tauri/Cargo.toml
 ```
 
@@ -75,6 +90,11 @@ cargo build --release --manifest-path src-tauri/Cargo.toml
 对照 [bridge/stubs/](./bridge/stubs/) 里的最小 IntelliJ API 声明；设置
 `REBASED_HOME` 指向 Rebased 安装目录时改为对照真实的 `lib\*.jar` 编译，用来确认
 stubs 和目标平台一致。编好的 jar 通过 `include_bytes!` 嵌进 worker。
+
+Java 测试覆盖嵌套协议、消息限额、按项目文字增强和窗口发现/隔离/关闭/恢复。
+`-WindowTests` 要求桌面环境（创建但不显示 Swing 窗口）；CI 无桌面时可省略该选项，
+其余测试仍执行。`Run-NativePainterApiTest.ps1` 对真实 Rebased jar 检查内部窗口绘制接口，
+不启动 IDE、不修改用户设置；内部接口不兼容时明确失败，不退回全局同步背景。
 
 `cargo build --release` 产出 `src-tauri/target/release/rebased-background-studio.exe`；
 发布 zip 会把它命名为 `Rebased Background Studio.exe`。壳启动时会带 `--plugin`，worker
